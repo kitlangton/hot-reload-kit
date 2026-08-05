@@ -1,0 +1,32 @@
+name: HotReloadExample
+options:
+  bundleIdPrefix: dev.kitlangton
+  deploymentTarget:
+    iOS: "18.0"
+packages:
+  ComposableArchitecture:
+    url: https://github.com/pointfreeco/swift-composable-architecture
+    exactVersion: 1.26.1
+  HotReloadKit:
+    path: ..
+targets:
+  HotReloadExample:
+    type: application
+    platform: iOS
+    sources:
+      - App
+    dependencies:
+      - package: ComposableArchitecture
+        product: ComposableArchitecture
+      - package: HotReloadKit
+        product: HotReloadUI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.kitlangton.HotReloadExample
+        GENERATE_INFOPLIST_FILE: true
+        ENABLE_DEBUG_DYLIB: false
+        SWIFT_VERSION: 6.0
+        SWIFT_ENABLE_OPAQUE_TYPE_ERASURE: true
+        OTHER_SWIFT_FLAGS: "$(inherited) -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-private-imports"
+        OTHER_LDFLAGS: "$(inherited) -Xlinker -export_dynamic"
+    scheme: {}

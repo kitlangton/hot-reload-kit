@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+DerivedData/
+Example/HotReloadExample.xcodeproj/
+Example/.hotreload/
+*.xcuserstate
+xcuserdata/
