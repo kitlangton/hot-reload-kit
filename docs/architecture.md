@@ -6,9 +6,9 @@ HotReloadKit has one external seam: a developer runs `hotreload` against a proje
 
 ### HotReloadCore
 
-`ReplacementPlanner` parses baseline and edited source with SwiftSyntax. It compares both files after replacing their `body` accessor blocks with the same marker.
+`ReplacementPlanner` parses baseline and edited source with SwiftSyntax. It compares both files after replacing their `body` accessor blocks with the same marker, and for non-`View` opaque return types (such as TCA reducers) it also verifies that edits remain inside `Reduce { ... }` closure bodies so the underlying opaque return type does not change.
 
-If the remaining source is identical, it emits a source-scoped dynamic replacement thunk. Otherwise it returns `.rebuild` with a reason. This conservative comparison means unsupported syntax cannot accidentally be classified as safe.
+If the remaining source is identical, it emits a source-scoped dynamic replacement thunk. If the edited syntax tree contains unbalanced parse errors, it rejects the edit immediately without triggering a build. Otherwise it returns `.rebuild` with a reason. This conservative comparison means unsupported syntax cannot accidentally be classified as safe.
 
 ### hotreload
 

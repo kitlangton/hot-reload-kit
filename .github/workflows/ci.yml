@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+           latest_xcode="$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)"
+           echo "Using $latest_xcode"
+           sudo xcode-select -s "$latest_xcode"
+           xcodebuild -version
+           swift --version
+
+      - name: Build CLI and targets
+        run: swift build
+
+      - name: Run unit tests
+        run: swift test
