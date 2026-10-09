@@ -24,9 +24,11 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.kitlangton.HotReloadExample
         GENERATE_INFOPLIST_FILE: true
-        ENABLE_DEBUG_DYLIB: false
         SWIFT_VERSION: 6.0
-        SWIFT_ENABLE_OPAQUE_TYPE_ERASURE: true
-        OTHER_SWIFT_FLAGS: "$(inherited) -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-private-imports"
-        OTHER_LDFLAGS: "$(inherited) -Xlinker -export_dynamic"
+      configs:
+        Debug:
+          ENABLE_DEBUG_DYLIB: false
+          SWIFT_ENABLE_OPAQUE_TYPE_ERASURE: true
+          OTHER_SWIFT_FLAGS: "$(inherited) -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-private-imports"
+          OTHER_LDFLAGS: "$(inherited) -Xlinker -export_dynamic"
     scheme: {}

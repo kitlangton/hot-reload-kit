@@ -14,8 +14,8 @@ let package = Package(
     .executable(name: "hotreload", targets: ["HotReloadCLI"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.8.2"),
-    .package(url: "https://github.com/swiftlang/swift-syntax.git", exact: "603.0.2"),
+    .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
+    .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0"..<"605.0.0"),
   ],
   targets: [
     .target(name: "HotReloadProtocol"),

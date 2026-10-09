@@ -2,7 +2,7 @@ import Combine
 import Foundation
 import HotReloadProtocol
 
-#if DEBUG
+#if DEBUG && (targetEnvironment(simulator) || os(macOS))
   import Darwin
 #endif
 
@@ -20,7 +20,7 @@ public final class HotReloadObserver: ObservableObject {
   }
 }
 
-#if DEBUG
+#if DEBUG && (targetEnvironment(simulator) || os(macOS))
   @MainActor
   public enum HotReloadRuntime {
     private static var loadedArtifacts: [UnsafeMutableRawPointer] = []
@@ -97,7 +97,14 @@ public final class HotReloadObserver: ObservableObject {
           case .loaded: error = nil
           case .failed(let message): error = message
           }
-          pendingReceipt = ReloadReceipt(generation: generation, error: error)
+          let receipt = ReloadReceipt(generation: generation, error: error)
+          if let encoded = try? encoder.encode(receipt),
+            (try? encoded.write(to: receiptURL, options: .atomic)) != nil
+          {
+            pendingReceipt = nil
+          } else {
+            pendingReceipt = receipt
+          }
         }
         try? await Task.sleep(for: .milliseconds(120))
       }

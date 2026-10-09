@@ -24,7 +24,8 @@ struct HotReloadCommand: AsyncParsableCommand {
   var simulator: String?
 
   @Option(help: "DerivedData directory.")
-  var derivedData = "/private/tmp/HotReloadKitDerivedData"
+  var derivedData = FileManager.default.temporaryDirectory
+    .appending(path: "HotReloadKitDerivedData", directoryHint: .isDirectory).path
 
   @Flag(help: "Run xcodegen before the initial build and structural rebuilds.")
   var xcodegen = false
@@ -33,16 +34,33 @@ struct HotReloadCommand: AsyncParsableCommand {
   var useProjectBuildSettings = false
 
   mutating func run() async throws {
+    setbuf(stdout, nil)
+    setbuf(stderr, nil)
+
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     let projectURL = resolve(project, relativeTo: root)
     let sourceURL = resolve(source, relativeTo: root)
     let derivedDataURL = resolve(derivedData, relativeTo: root)
+
+    guard FileManager.default.fileExists(atPath: projectURL.path) else {
+      throw HotReloadError("Project not found at \(projectURL.path)")
+    }
+    guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+      throw HotReloadError("Source file not found at \(sourceURL.path)")
+    }
+
     let sessionURL = derivedDataURL.appending(
       path: "HotReloadSession-\(ProcessInfo.processInfo.processIdentifier)",
       directoryHint: .isDirectory
     )
-    try FileManager.default.createDirectory(at: sessionURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+      at: sessionURL,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
     defer { try? FileManager.default.removeItem(at: sessionURL) }
+    let signalSources = Self.installSignalCleanup(removing: sessionURL)
+    defer { signalSources.forEach { $0.cancel() } }
 
     let deviceID = try simulator ?? Self.bootedSimulatorID()
     var session = Session(
@@ -62,9 +80,21 @@ struct HotReloadCommand: AsyncParsableCommand {
 
     while true {
       try await Task.sleep(for: .milliseconds(150))
-      guard let edited = try? String(contentsOf: sourceURL, encoding: .utf8),
-        edited != lastSeenSource
+      guard let initialRead = try? String(contentsOf: sourceURL, encoding: .utf8),
+        !initialRead.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        initialRead != lastSeenSource
       else { continue }
+
+      var edited = initialRead
+      for _ in 0..<6 {
+        try await Task.sleep(for: .milliseconds(50))
+        guard let latest = try? String(contentsOf: sourceURL, encoding: .utf8),
+          !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { break }
+        if latest == edited { break }
+        edited = latest
+      }
+      guard edited != lastSeenSource else { continue }
       lastSeenSource = edited
 
       do {
@@ -75,12 +105,27 @@ struct HotReloadCommand: AsyncParsableCommand {
     }
   }
 
+  private static func installSignalCleanup(removing sessionURL: URL) -> [any DispatchSourceSignal] {
+    [SIGINT, SIGTERM].map { sig in
+      signal(sig, SIG_IGN)
+      let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+      source.setEventHandler {
+        try? FileManager.default.removeItem(at: sessionURL)
+        _exit(128 + sig)
+      }
+      source.resume()
+      return source
+    }
+  }
+
   private static func bootedSimulatorID() throws -> String {
     let data = try ProcessRunner.capture("xcrun", ["simctl", "list", "devices", "booted", "-j"])
     let listing = try JSONDecoder().decode(SimulatorListing.self, from: Data(data.utf8))
-    let iOSDevices = listing.devices
-      .filter { $0.key.contains("iOS") }
-      .flatMap(\.value)
+    let iOSDevices = listing.devices.keys
+      .filter { $0.contains("iOS") }
+      .sorted()
+      .reversed()
+      .flatMap { listing.devices[$0] ?? [] }
     guard let device = iOSDevices.first(where: { $0.state == "Booted" }) else {
       throw HotReloadError("No booted iOS Simulator. Boot one or pass --simulator <UDID>.")
     }
@@ -128,12 +173,21 @@ private struct Session {
 
   mutating func bootstrap() throws {
     baseline = try String(contentsOf: source, encoding: .utf8)
+    if !ReplacementPlanner.hasSingleReloadableBody(in: baseline) {
+      print(
+        "[hotreload] warning: \(source.lastPathComponent) does not have a single reloadable body; edits will trigger full rebuilds"
+      )
+    }
     try buildAndLaunch()
     print("[hotreload] baseline app is running")
   }
 
   mutating func apply(editedSource: String) throws {
     guard let settings else { throw HotReloadError("Build settings are unavailable") }
+    if generation == 0, editedSource == baseline {
+      print("[hotreload] source matches running baseline")
+      return
+    }
     let nextGeneration = generation + 1
     let plan = try ReplacementPlanner.plan(
       baseline: baseline,
@@ -154,10 +208,10 @@ private struct Session {
       let startedAt = ContinuousClock.now
       let artifact = try compile(
         replacement: replacement, generation: nextGeneration, settings: settings)
+      defer { try? FileManager.default.removeItem(at: artifact) }
       generation = nextGeneration
       try publish(artifact: artifact, declaration: replacement.declaration)
       let receipt = try waitForReceipt(generation: generation)
-      try? FileManager.default.removeItem(at: artifact)
       if let error = receipt.error {
         throw HotReloadError("Runtime rejected generation \(generation): \(error)")
       }
@@ -180,9 +234,6 @@ private struct Session {
         "xcodegen", ["generate"], directory: projectDirectory)
     }
 
-    try? FileManager.default.removeItem(at: manifest)
-    try? FileManager.default.removeItem(at: receipt)
-
     print("[hotreload] preparing simulator")
     try ProcessRunner.run("xcrun", ["simctl", "boot", deviceID], quiet: true, allowFailure: true)
     try ProcessRunner.run("xcrun", ["simctl", "bootstatus", deviceID, "-b"], quiet: true)
@@ -197,14 +248,20 @@ private struct Session {
       buildArguments(command: "-showBuildSettings") + ["-json"],
       directory: projectDirectory
     )
+    let jsonSubstring =
+      settingsJSON.firstIndex(of: "[").map { settingsJSON[$0...] } ?? Substring(settingsJSON)
     let decoded = try JSONDecoder().decode(
-      [BuildSettingsEnvelope].self, from: Data(settingsJSON.utf8))
+      [BuildSettingsEnvelope].self, from: Data(jsonSubstring.utf8))
+    let appEnvelopes = decoded.filter {
+      $0.buildSettings["PRODUCT_TYPE"] == "com.apple.product-type.application"
+    }
     guard
-      let values = decoded.first(where: {
-        $0.buildSettings["PRODUCT_TYPE"] == "com.apple.product-type.application"
-      })?.buildSettings
+      let values =
+        (appEnvelopes.first(where: {
+          $0.target == scheme || $0.buildSettings["TARGET_NAME"] == scheme
+        }) ?? appEnvelopes.first)?.buildSettings
     else {
-      throw HotReloadError("xcodebuild returned no build settings")
+      throw HotReloadError("xcodebuild returned no application build settings")
     }
     let sdk = try ProcessRunner.captureTrimmed(
       "xcrun", ["--sdk", "iphonesimulator", "--show-sdk-path"])
@@ -216,6 +273,10 @@ private struct Session {
     print("[hotreload] installing baseline")
     try ProcessRunner.run(
       "xcrun", ["simctl", "install", deviceID, buildSettings.app.path], quiet: true)
+
+    try? FileManager.default.removeItem(at: manifest)
+    try? FileManager.default.removeItem(at: receipt)
+
     try ProcessRunner.run(
       "xcrun",
       [
@@ -255,7 +316,10 @@ private struct Session {
     let artifactDirectory = sessionDirectory.appending(
       path: "Artifacts", directoryHint: .isDirectory)
     try FileManager.default.createDirectory(
-      at: artifactDirectory, withIntermediateDirectories: true)
+      at: artifactDirectory,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
     let base = "\(source.deletingPathExtension().lastPathComponent).\(generation)"
     let thunk = artifactDirectory.appending(path: "\(base).swift")
     let object = artifactDirectory.appending(path: "\(base).o")
@@ -270,14 +334,15 @@ private struct Session {
       [
         "--sdk", "iphonesimulator", "swiftc",
         "-emit-object", "-parse-as-library",
+        "-module-name", "HotReloadThunk_\(generation)",
         thunk.path,
         "-o", object.path,
         "-target", "\(settings.architecture)-apple-ios\(settings.deploymentTarget)-simulator",
         "-swift-version", settings.swiftVersion,
         "-sdk", settings.sdk,
         "-I", settings.targetBuildDirectory.path,
-        "-F", settings.targetBuildDirectory.path,
-      ] + settings.compilationConditions.flatMap { ["-D", $0] }
+      ] + settings.frameworkSearchFlags
+      + settings.compilationConditions.flatMap { ["-D", $0] }
       + settings.compilerArguments
     if let strictConcurrency = settings.strictConcurrency {
       compilerArguments += ["-Xfrontend", "-strict-concurrency=\(strictConcurrency.lowercased())"]
@@ -298,6 +363,7 @@ private struct Session {
         "-bundle_loader", settings.executable.path,
         "-L", settings.swiftLibraries.path,
         "-rpath", "/usr/lib/swift",
+      ] + settings.frameworkSearchFlags + [
         "-o", bundle.path,
         object.path,
       ])
@@ -329,6 +395,7 @@ private struct Session {
 }
 
 private struct BuildSettingsEnvelope: Decodable {
+  let target: String?
   let buildSettings: [String: String]
 }
 
@@ -345,6 +412,7 @@ private struct BuildSettings {
   let executable: URL
   let sdk: String
   let swiftLibraries: URL
+  let frameworkSearchFlags: [String]
   let compilerArguments: [String]
 
   init(values: [String: String], sdk: String, swiftc: String) throws {
@@ -367,11 +435,32 @@ private struct BuildSettings {
     compilationConditions = (values["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] ?? "DEBUG")
       .split(whereSeparator: { $0.isWhitespace })
       .map(String.init)
-    compilerArguments =
+    targetBuildDirectory = URL(fileURLWithPath: try required("TARGET_BUILD_DIR"))
+
+    var frameworkFlags = ["-F", targetBuildDirectory.path]
+    let packageFrameworks = targetBuildDirectory.appending(
+      path: "PackageFrameworks", directoryHint: .isDirectory)
+    if FileManager.default.fileExists(atPath: packageFrameworks.path) {
+      frameworkFlags += ["-F", packageFrameworks.path]
+    }
+    frameworkFlags += Self.searchPaths(in: values["FRAMEWORK_SEARCH_PATHS"], flag: "-F")
+    frameworkSearchFlags = frameworkFlags
+
+    var swiftArgs =
       Self.arguments(in: values["OTHER_SWIFT_FLAGS"])
       + Self.searchPaths(in: values["SWIFT_INCLUDE_PATHS"], flag: "-I")
-      + Self.searchPaths(in: values["FRAMEWORK_SEARCH_PATHS"], flag: "-F")
-    targetBuildDirectory = URL(fileURLWithPath: try required("TARGET_BUILD_DIR"))
+    if values["SWIFT_DEFAULT_ACTOR_ISOLATION"] == "MainActor",
+      !swiftArgs.contains("-default-isolation=MainActor")
+    {
+      swiftArgs += ["-default-isolation=MainActor"]
+    }
+    if values["SWIFT_ENABLE_OPAQUE_TYPE_ERASURE"] == "YES",
+      !swiftArgs.contains("OpaqueTypeErasure")
+    {
+      swiftArgs += ["-enable-experimental-feature", "OpaqueTypeErasure"]
+    }
+    compilerArguments = swiftArgs
+
     app = targetBuildDirectory.appending(
       path: try required("FULL_PRODUCT_NAME"), directoryHint: .isDirectory)
     executable = app.appending(path: try required("EXECUTABLE_NAME"))
@@ -383,7 +472,16 @@ private struct BuildSettings {
   }
 
   private static func searchPaths(in value: String?, flag: String) -> [String] {
-    arguments(in: value).flatMap { [flag, $0] }
+    guard let value else { return [] }
+    let cleaned = value.replacingOccurrences(of: "$(inherited)", with: "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleaned.isEmpty else { return [] }
+    if !cleaned.contains("\""), !cleaned.contains("'"),
+      FileManager.default.fileExists(atPath: cleaned)
+    {
+      return [flag, cleaned]
+    }
+    return arguments(in: cleaned).flatMap { [flag, $0] }
   }
 
   private static func arguments(in value: String?) -> [String] {

@@ -137,3 +137,139 @@ func anotherBodyRequiresRebuild() throws {
 
   #expect(plan == .rebuild(reason: "The edited file no longer has exactly one reloadable body"))
 }
+
+@Test("changing opaque reducer builder composition requires a rebuild")
+func reducerCompositionChangeRequiresRebuild() throws {
+  let baseline = """
+    import ComposableArchitecture
+
+    @Reducer
+    struct CounterFeature {
+      @ObservableState
+      struct State: Equatable { var count = 0 }
+      enum Action { case increment }
+
+      var body: some ReducerOf<Self> {
+        Reduce { state, action in
+          switch action {
+          case .increment:
+            state.count += 1
+            return .none
+          }
+        }
+      }
+    }
+    """
+  let edited = baseline.replacingOccurrences(
+    of: "      }\n    }\n  }",
+    with: """
+            }
+          }
+          Reduce { _, _ in .none }
+        }
+      """
+  )
+
+  let plan = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: edited,
+    module: "ExampleApp",
+    sourceFile: "CounterFeature.swift",
+    generation: 1
+  )
+
+  #expect(plan == .rebuild(reason: "Changing opaque reducer composition requires a rebuild"))
+}
+
+@Test("a syntax error with unbalanced braces throws syntaxError instead of rebuilding")
+func unbalancedBraceThrowsSyntaxError() {
+  let baseline = """
+    import SwiftUI
+
+    struct GreetingView: View {
+      var body: some View {
+        VStack {
+          Text("Before")
+        }
+      }
+    }
+    """
+  let edited = """
+    import SwiftUI
+
+    struct GreetingView: View {
+      var body: some View {
+        VStack {
+          Text("After")
+      }
+    }
+    """
+
+  #expect(throws: ReplacementPlanningError.syntaxError) {
+    try ReplacementPlanner.plan(
+      baseline: baseline,
+      edited: edited,
+      module: "ExampleApp",
+      sourceFile: "GreetingView.swift",
+      generation: 1
+    )
+  }
+}
+
+@Test("a view nested inside an enum requires a rebuild")
+func nestedInEnumRequiresRebuild() throws {
+  let baseline = """
+    import SwiftUI
+
+    enum Namespace {
+      struct GreetingView: View {
+        var body: some View { Text("Before") }
+      }
+    }
+    """
+  let edited = baseline.replacingOccurrences(of: "Before", with: "After")
+
+  let plan = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: edited,
+    module: "ExampleApp",
+    sourceFile: "GreetingView.swift",
+    generation: 1
+  )
+
+  #expect(plan == .rebuild(reason: "Nested declarations are not reloadable yet"))
+}
+
+@Test("a local variable named body inside a helper method does not block view reload")
+func localBodyVariableInMethodIsIgnored() throws {
+  let baseline = """
+    import SwiftUI
+
+    struct GreetingView: View {
+      func format() -> String {
+        var body: String { "helper" }
+        return body
+      }
+
+      var body: some View {
+        Text("Before")
+      }
+    }
+    """
+  let edited = baseline.replacingOccurrences(of: "Before", with: "After")
+
+  let plan = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: edited,
+    module: "ExampleApp",
+    sourceFile: "GreetingView.swift",
+    generation: 1
+  )
+
+  guard case .replace(let replacement) = plan else {
+    Issue.record("Expected a replacement thunk")
+    return
+  }
+  #expect(replacement.declaration == "GreetingView")
+  #expect(replacement.source.contains("Text(\"After\")"))
+}
