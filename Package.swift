@@ -56,7 +56,7 @@ let package = Package(
     ),
     .testTarget(
       name: "HotReloadRuntimeTests",
-      dependencies: ["HotReloadRuntime"]
+      dependencies: ["HotReloadRuntime", "HotReloadUI"]
     ),
     .testTarget(
       name: "HotReloadMacrosTests",

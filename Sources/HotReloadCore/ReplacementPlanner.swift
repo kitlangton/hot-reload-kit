@@ -4,10 +4,13 @@ import SwiftSyntax
 
 package struct Replacement: Equatable, Sendable {
   package let declaration: String
+  package let declarations: [String]
   package let source: String
 
-  package init(declaration: String, source: String) {
-    self.declaration = declaration
+  package init(declaration: String, declarations: [String]? = nil, source: String) {
+    let resolvedDeclarations = declarations ?? [declaration]
+    self.declaration = resolvedDeclarations.first ?? declaration
+    self.declarations = resolvedDeclarations
     self.source = source
   }
 }
@@ -25,7 +28,7 @@ package enum ReplacementPlanningError: Error, Equatable, CustomStringConvertible
   public var description: String {
     switch self {
     case .noReloadableBody:
-      "The source file does not contain a reloadable computed body"
+      "The source file does not contain a reloadable computed body or class method"
     case .multipleReloadableBodies:
       "The source file contains multiple computed bodies"
     case .syntaxError:
@@ -45,41 +48,57 @@ package enum ReplacementPlanner {
     let baselineSyntax = Parser.parse(source: baseline)
     let editedSyntax = Parser.parse(source: edited)
 
-    let baselineBody: ViewBody
-    do {
-      baselineBody = try viewBody(in: baselineSyntax)
-    } catch {
+    let baselineCollection = collectUnits(in: baselineSyntax)
+    let editedCollection = collectUnits(in: editedSyntax)
+
+    guard !baselineCollection.units.isEmpty else {
       if editedSyntax.hasError {
         throw ReplacementPlanningError.syntaxError
       }
       return .rebuild(reason: "The baseline file does not have a single reloadable body")
     }
 
-    let editedBody: ViewBody
-    do {
-      editedBody = try viewBody(in: editedSyntax)
-    } catch ReplacementPlanningError.noReloadableBody where editedSyntax.hasError {
-      throw ReplacementPlanningError.syntaxError
-    } catch {
-      return .rebuild(reason: "The edited file no longer has exactly one reloadable body")
-    }
-
-    guard !editedBody.isNested else {
-      return .rebuild(reason: "Nested declarations are not reloadable yet")
-    }
-    guard !edited.contains("#if") else {
-      return .rebuild(reason: "Conditional compilation requires a rebuild")
-    }
-
-    guard baselineBody.declaration == editedBody.declaration else {
+    guard !editedCollection.units.isEmpty else {
       if editedSyntax.hasError {
         throw ReplacementPlanningError.syntaxError
       }
-      return .rebuild(reason: "The enclosing view declaration changed")
+      return .rebuild(reason: "The edited file no longer has exactly one reloadable body")
     }
+
+    let baselineStructBodies = baselineCollection.units.filter { $0.kind == .structBody }
+    let editedStructBodies = editedCollection.units.filter { $0.kind == .structBody }
+    if baselineStructBodies.count != editedStructBodies.count {
+      if editedSyntax.hasError {
+        throw ReplacementPlanningError.syntaxError
+      }
+      return .rebuild(reason: "The edited file no longer has exactly one reloadable body")
+    }
+
+    guard baselineCollection.units.count == editedCollection.units.count else {
+      if editedSyntax.hasError {
+        throw ReplacementPlanningError.syntaxError
+      }
+      return .rebuild(reason: "The edited file changes reloadable declarations")
+    }
+
+    for (baseUnit, editUnit) in zip(baselineCollection.units, editedCollection.units) {
+      guard baseUnit.declaration == editUnit.declaration else {
+        if editedSyntax.hasError {
+          throw ReplacementPlanningError.syntaxError
+        }
+        return .rebuild(reason: "The enclosing view declaration changed")
+      }
+      guard baseUnit.headerKey == editUnit.headerKey else {
+        if editedSyntax.hasError {
+          throw ReplacementPlanningError.syntaxError
+        }
+        return .rebuild(reason: "The edit changes code outside the computed body")
+      }
+    }
+
     guard
-      replacingBody(in: baseline, body: baselineBody, with: "{}")
-        == replacingBody(in: edited, body: editedBody, with: "{}")
+      replacingUnits(in: baseline, units: baselineCollection.units, with: "{}")
+        == replacingUnits(in: edited, units: editedCollection.units, with: "{}")
     else {
       if editedSyntax.hasError {
         throw ReplacementPlanningError.syntaxError
@@ -87,54 +106,106 @@ package enum ReplacementPlanner {
       return .rebuild(reason: "The edit changes code outside the computed body")
     }
 
-    if isNonErasedOpaqueReturnType(editedBody.returnType) {
-      if editedSyntax.hasError {
-        throw ReplacementPlanningError.syntaxError
-      }
-      guard
-        let baselineReduced = replacingReduceClosureBodies(in: baselineBody.statements),
-        let editedReduced = replacingReduceClosureBodies(in: editedBody.statements),
-        baselineReduced == editedReduced
-      else {
-        return .rebuild(reason: "Changing opaque reducer composition requires a rebuild")
-      }
+    if editedSyntax.hasError {
+      throw ReplacementPlanningError.syntaxError
     }
 
-    let statements = dedent(editedBody.statements).trimmingCharacters(in: .whitespacesAndNewlines)
-      .split(separator: "\n", omittingEmptySubsequences: false)
-      .map { "    \($0)" }
-      .joined(separator: "\n")
-    let imports = editedBody.imports.joined(separator: "\n")
+    var changedIndices: [Int] = []
+    for index in editedCollection.units.indices {
+      if baselineCollection.units[index].statements != editedCollection.units[index].statements {
+        changedIndices.append(index)
+      }
+    }
+    if changedIndices.isEmpty {
+      changedIndices = [0]
+    }
 
-    return .replace(
-      Replacement(
-        declaration: editedBody.declaration,
-        source: """
-          @_private(sourceFile: "\(sourceFile)") import \(module)
-          \(imports)
+    var extensionBlocks: [String] = []
+    var changedDeclarations: [String] = []
 
-          extension \(editedBody.declaration) {
+    for index in changedIndices {
+      let baseUnit = baselineCollection.units[index]
+      let editUnit = editedCollection.units[index]
+
+      if let unsafetyReason = editUnit.unsafetyReason {
+        return .rebuild(reason: unsafetyReason)
+      }
+
+      if editUnit.kind == .structBody, isNonErasedOpaqueReturnType(editUnit.returnType) {
+        guard
+          let baselineReduced = replacingReduceClosureBodies(in: baseUnit.statements),
+          let editedReduced = replacingReduceClosureBodies(in: editUnit.statements),
+          baselineReduced == editedReduced
+        else {
+          return .rebuild(reason: "Changing opaque reducer composition requires a rebuild")
+        }
+      }
+
+      let statements = dedent(editUnit.statements).trimmingCharacters(in: .whitespacesAndNewlines)
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { $0.isEmpty ? "" : "    \($0)" }
+        .joined(separator: "\n")
+
+      switch editUnit.kind {
+      case .structBody:
+        extensionBlocks.append(
+          """
+          extension \(editUnit.declaration) {
             @_dynamicReplacement(for: body)
-            var __hotReload_body_\(generation): \(editedBody.returnType) {
+            var __hotReload_body_\(generation): \(editUnit.returnType) {
           \(statements)
             }
           }
           """
+        )
+      case .classMethod(let method):
+        let suffix = changedIndices.count > 1 ? "\(index)_\(generation)" : "\(generation)"
+        extensionBlocks.append(
+          """
+          extension \(editUnit.declaration) {
+            @_dynamicReplacement(for: \(method.dynamicReplacementTarget))
+            \(method.replacementPrefix)func __hotReload_\(method.baseName)_\(suffix)\(method.cleanedSignature) {
+          \(statements)
+            }
+          }
+          """
+        )
+      }
+
+      if !changedDeclarations.contains(editUnit.declaration) {
+        changedDeclarations.append(editUnit.declaration)
+      }
+    }
+
+    let importsBlock = editedCollection.imports.joined(separator: "\n")
+    let importSection = importsBlock.isEmpty ? "" : "\n\(importsBlock)"
+    let extensionsSource = extensionBlocks.joined(separator: "\n\n")
+
+    return .replace(
+      Replacement(
+        declaration: changedDeclarations[0],
+        declarations: changedDeclarations,
+        source: """
+          @_private(sourceFile: "\(sourceFile)") import \(module)\(importSection)
+
+          \(extensionsSource)
+          """
       ))
   }
 
-  package static func hasSingleReloadableBody(in source: String) -> Bool {
-    (try? viewBody(in: Parser.parse(source: source))) != nil
+  package static func hasReloadableDeclarations(in source: String) -> Bool {
+    let collection = collectUnits(in: Parser.parse(source: source))
+    return collection.units.contains { $0.unsafetyReason == nil }
   }
 
-  private static func viewBody(in syntax: SourceFileSyntax) throws -> ViewBody {
-    let collector = ViewBodyCollector(viewMode: .sourceAccurate)
+  package static func hasSingleReloadableBody(in source: String) -> Bool {
+    hasReloadableDeclarations(in: source)
+  }
+
+  private static func collectUnits(in syntax: SourceFileSyntax) -> CollectedFile {
+    let collector = ReloadableUnitCollector(viewMode: .sourceAccurate)
     collector.walk(syntax)
-    guard collector.bodies.count == 1 else {
-      if collector.bodies.isEmpty { throw ReplacementPlanningError.noReloadableBody }
-      throw ReplacementPlanningError.multipleReloadableBodies
-    }
-    return collector.bodies[0]
+    return collector.finalize()
   }
 
   private static func isNonErasedOpaqueReturnType(_ returnType: String) -> Bool {
@@ -154,11 +225,16 @@ package enum ReplacementPlanner {
     return String(decoding: bytes, as: UTF8.self)
   }
 
-  private static func replacingBody(in source: String, body: ViewBody, with replacement: String)
-    -> String
-  {
+  private static func replacingUnits(
+    in source: String,
+    units: [ReloadableUnit],
+    with replacement: String
+  ) -> String {
     var bytes = Array(source.utf8)
-    bytes.replaceSubrange(body.startOffset..<body.endOffset, with: replacement.utf8)
+    let sorted = units.sorted { $0.startOffset < $1.startOffset }
+    for unit in sorted.reversed() {
+      bytes.replaceSubrange(unit.startOffset..<unit.endOffset, with: replacement.utf8)
+    }
     return String(decoding: bytes, as: UTF8.self)
   }
 
@@ -173,79 +249,150 @@ package enum ReplacementPlanner {
   }
 }
 
-private struct ViewBody {
-  let declaration: String
-  let returnType: String
-  let statements: String
-  let imports: [String]
-  let isNested: Bool
-  let startOffset: Int
-  let endOffset: Int
+private struct ClassMethodInfo: Equatable {
+  let baseName: String
+  let dynamicReplacementTarget: String
+  let replacementPrefix: String
+  let cleanedSignature: String
+  let fullOriginalHeader: String
 }
 
-private final class ViewBodyCollector: SyntaxVisitor {
-  var bodies: [ViewBody] = []
-  private var declarationNames: [String] = []
-  private var nestingDepth = 0
+private enum ReloadableUnitKind: Equatable {
+  case structBody
+  case classMethod(ClassMethodInfo)
+}
+
+private struct ReloadableUnit {
+  let declaration: String
+  let kind: ReloadableUnitKind
+  let returnType: String
+  let statements: String
+  let unsafetyReason: String?
+  let startOffset: Int
+  let endOffset: Int
+
+  var headerKey: String {
+    switch kind {
+    case .structBody:
+      return "struct:\(declaration):body:\(returnType)"
+    case .classMethod(let method):
+      return "class:\(declaration):func:\(method.fullOriginalHeader)"
+    }
+  }
+}
+
+private struct CollectedFile {
+  let imports: [String]
+  let units: [ReloadableUnit]
+}
+
+private final class ReloadableUnitCollector: SyntaxVisitor {
+  private enum EnclosingContext {
+    case structDecl(name: String, isGeneric: Bool)
+    case classDecl(name: String, isGeneric: Bool)
+    case other
+  }
+
+  private var stack: [EnclosingContext] = []
   private var imports: [String] = []
+  private var rawUnits: [ReloadableUnit] = []
+
+  func finalize() -> CollectedFile {
+    var methodTargetCounts: [String: Int] = [:]
+    for unit in rawUnits {
+      if case .classMethod(let method) = unit.kind {
+        let key = "\(unit.declaration).\(method.dynamicReplacementTarget)"
+        methodTargetCounts[key, default: 0] += 1
+      }
+    }
+
+    let resolved = rawUnits.map { unit -> ReloadableUnit in
+      guard unit.unsafetyReason == nil,
+        case .classMethod(let method) = unit.kind
+      else {
+        return unit
+      }
+      let key = "\(unit.declaration).\(method.dynamicReplacementTarget)"
+      if (methodTargetCounts[key] ?? 0) > 1 {
+        return ReloadableUnit(
+          declaration: unit.declaration,
+          kind: unit.kind,
+          returnType: unit.returnType,
+          statements: unit.statements,
+          unsafetyReason: "Overloaded methods with identical argument labels require a rebuild",
+          startOffset: unit.startOffset,
+          endOffset: unit.endOffset
+        )
+      }
+      return unit
+    }
+
+    return CollectedFile(imports: imports, units: resolved)
+  }
 
   override func visit(_ node: ImportDeclSyntax) -> SyntaxVisitorContinueKind {
     imports.append(node.trimmedDescription)
     return .skipChildren
   }
 
+  override func visit(_ node: IfConfigDeclSyntax) -> SyntaxVisitorContinueKind {
+    if stack.isEmpty, Self.containsOnlyImports(node) {
+      imports.append(node.trimmedDescription)
+      return .skipChildren
+    }
+    return .visitChildren
+  }
+
   override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
-    declarationNames.append(node.name.text)
-    nestingDepth += 1
+    stack.append(.structDecl(name: node.name.text, isGeneric: node.genericParameterClause != nil))
     return .visitChildren
   }
 
   override func visitPost(_ node: StructDeclSyntax) {
-    declarationNames.removeLast()
-    nestingDepth -= 1
-  }
-
-  override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
-    nestingDepth += 1
-    return .visitChildren
-  }
-
-  override func visitPost(_ node: EnumDeclSyntax) {
-    nestingDepth -= 1
+    stack.removeLast()
   }
 
   override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
-    nestingDepth += 1
+    stack.append(.classDecl(name: node.name.text, isGeneric: node.genericParameterClause != nil))
     return .visitChildren
   }
 
   override func visitPost(_ node: ClassDeclSyntax) {
-    nestingDepth -= 1
+    stack.removeLast()
+  }
+
+  override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
+    stack.append(.other)
+    return .visitChildren
+  }
+
+  override func visitPost(_ node: EnumDeclSyntax) {
+    stack.removeLast()
   }
 
   override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind {
-    nestingDepth += 1
+    stack.append(.other)
     return .visitChildren
   }
 
   override func visitPost(_ node: ActorDeclSyntax) {
-    nestingDepth -= 1
+    stack.removeLast()
   }
 
   override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
-    nestingDepth += 1
+    stack.append(.other)
     return .visitChildren
   }
 
   override func visitPost(_ node: ExtensionDeclSyntax) {
-    nestingDepth -= 1
-  }
-
-  override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
-    .skipChildren
+    stack.removeLast()
   }
 
   override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
+    .skipChildren
+  }
+
+  override func visit(_ node: DeinitializerDeclSyntax) -> SyntaxVisitorContinueKind {
     .skipChildren
   }
 
@@ -254,7 +401,7 @@ private final class ViewBodyCollector: SyntaxVisitor {
   }
 
   override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
-    guard let declaration = declarationNames.last,
+    guard case .structDecl(let declaration, _) = stack.last,
       node.bindings.count == 1,
       let binding = node.bindings.first,
       binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text == "body",
@@ -263,17 +410,130 @@ private final class ViewBodyCollector: SyntaxVisitor {
       case .getter(let statements) = accessorBlock.accessors
     else { return .skipChildren }
 
-    bodies.append(
-      ViewBody(
+    let isNested = stack.count > 1
+    let unsafetyReason: String? = isNested ? "Nested declarations are not reloadable yet" : nil
+
+    rawUnits.append(
+      ReloadableUnit(
         declaration: declaration,
+        kind: .structBody,
         returnType: returnType,
         statements: statements.description,
-        imports: imports,
-        isNested: nestingDepth > 1 || declarationNames.count != 1,
+        unsafetyReason: unsafetyReason,
         startOffset: accessorBlock.positionAfterSkippingLeadingTrivia.utf8Offset,
         endOffset: accessorBlock.endPositionBeforeTrailingTrivia.utf8Offset
       ))
     return .skipChildren
+  }
+
+  override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
+    guard case .classDecl(let declaration, let isGenericClass) = stack.last,
+      let body = node.body
+    else { return .skipChildren }
+
+    let isNested = stack.count > 1
+    let baseName = node.name.text
+    let params = node.signature.parameterClause.parameters
+    let targetLabels = params.map { "\($0.firstName.text):" }.joined()
+    let dynamicTarget = params.isEmpty ? "\(baseName)()" : "\(baseName)(\(targetLabels))"
+
+    let cleanedParams = FunctionParameterListSyntax(
+      params.map { param in
+        var copy = param
+        if copy.defaultValue != nil {
+          copy.type = copy.type.trimmed
+          copy.defaultValue = nil
+        }
+        return copy
+      }
+    )
+    var cleanedSig = node.signature
+    cleanedSig.parameterClause.parameters = cleanedParams
+    let cleanedSignatureText = cleanedSig.trimmedDescription
+
+    let returnType = node.signature.returnClause?.type.trimmedDescription ?? "Void"
+
+    var prefixParts: [String] = []
+    for element in node.attributes {
+      if let attr = element.as(AttributeSyntax.self) {
+        let attrName = attr.attributeName.trimmedDescription
+        if attrName == "MainActor" || attrName == "ViewBuilder" || attrName == "discardableResult" {
+          prefixParts.append(attr.trimmedDescription)
+        }
+      }
+    }
+    for modifier in node.modifiers {
+      let modText = modifier.name.text
+      if modText == "nonisolated" {
+        prefixParts.append("nonisolated")
+      } else if modText == "static" || modText == "class" {
+        prefixParts.append("static")
+      }
+    }
+    let replacementPrefix = prefixParts.isEmpty ? "" : prefixParts.joined(separator: " ") + " "
+
+    let fullOriginalHeader =
+      "\(node.attributes.trimmedDescription)|\(node.modifiers.trimmedDescription)|\(node.name.text)|\(node.genericParameterClause?.trimmedDescription ?? "")|\(node.signature.trimmedDescription)|\(node.genericWhereClause?.trimmedDescription ?? "")"
+
+    var unsafetyReason: String?
+    if isNested {
+      unsafetyReason = "Nested declarations are not reloadable yet"
+    } else if isGenericClass {
+      unsafetyReason = "Generic classes require a rebuild"
+    } else if node.genericParameterClause != nil || node.genericWhereClause != nil {
+      unsafetyReason = "Generic class methods require a rebuild"
+    } else if (returnType == "some" || returnType.hasPrefix("some "))
+      && returnType != "some View" && returnType != "some SwiftUI.View"
+    {
+      unsafetyReason = "Class methods with opaque return types require a rebuild"
+    } else if Self.hasUnsupportedMethodAttribute(node.attributes) {
+      unsafetyReason = "Class methods with special runtime attributes require a rebuild"
+    }
+
+    let methodInfo = ClassMethodInfo(
+      baseName: baseName,
+      dynamicReplacementTarget: dynamicTarget,
+      replacementPrefix: replacementPrefix,
+      cleanedSignature: cleanedSignatureText,
+      fullOriginalHeader: fullOriginalHeader
+    )
+
+    rawUnits.append(
+      ReloadableUnit(
+        declaration: declaration,
+        kind: .classMethod(methodInfo),
+        returnType: returnType,
+        statements: body.statements.description,
+        unsafetyReason: unsafetyReason,
+        startOffset: body.positionAfterSkippingLeadingTrivia.utf8Offset,
+        endOffset: body.endPositionBeforeTrailingTrivia.utf8Offset
+      ))
+    return .skipChildren
+  }
+
+  private static func hasUnsupportedMethodAttribute(_ attributes: AttributeListSyntax) -> Bool {
+    for element in attributes {
+      guard let attr = element.as(AttributeSyntax.self) else { continue }
+      let name = attr.attributeName.trimmedDescription
+      if name == "NSManaged" || name == "cdecl" || name == "_cdecl" {
+        return true
+      }
+    }
+    return false
+  }
+
+  private static func containsOnlyImports(_ node: IfConfigDeclSyntax) -> Bool {
+    for clause in node.clauses {
+      guard case .statements(let statements) = clause.elements else { return false }
+      for item in statements {
+        if item.item.is(ImportDeclSyntax.self) { continue }
+        if let nestedIf = item.item.as(IfConfigDeclSyntax.self), containsOnlyImports(nestedIf) {
+          continue
+        }
+        return false
+      }
+    }
+    return true
   }
 }
 

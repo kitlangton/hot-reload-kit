@@ -7,7 +7,7 @@ import HotReloadProtocol
 struct HotReloadCommand: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "hotreload",
-    abstract: "Hot-reload safe Swift body edits in an iOS Simulator.",
+    abstract: "Hot-reload safe Swift body and class method edits in an iOS Simulator.",
     version: "0.1.0"
   )
 
@@ -17,8 +17,14 @@ struct HotReloadCommand: AsyncParsableCommand {
   @Option(help: "Scheme and application target to build.")
   var scheme: String
 
-  @Option(help: "Swift source file containing one reloadable computed body.")
-  var source: String
+  @Option(help: "Single Swift source file to watch.")
+  var source: String?
+
+  @Option(
+    name: .long,
+    help: "Directory or Swift file to watch (repeatable). Defaults to the project directory when --source is omitted."
+  )
+  var watch: [String] = []
 
   @Option(help: "Simulator UDID. Defaults to a booted simulator.")
   var simulator: String?
@@ -39,14 +45,31 @@ struct HotReloadCommand: AsyncParsableCommand {
 
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     let projectURL = resolve(project, relativeTo: root)
-    let sourceURL = resolve(source, relativeTo: root)
     let derivedDataURL = resolve(derivedData, relativeTo: root)
 
     guard FileManager.default.fileExists(atPath: projectURL.path) else {
       throw HotReloadError("Project not found at \(projectURL.path)")
     }
-    guard FileManager.default.fileExists(atPath: sourceURL.path) else {
-      throw HotReloadError("Source file not found at \(sourceURL.path)")
+
+    var watchTargets: [URL] = []
+    if let source {
+      let sourceURL = resolve(source, relativeTo: root)
+      guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+        throw HotReloadError("Source file not found at \(sourceURL.path)")
+      }
+      watchTargets.append(sourceURL)
+    }
+    for entry in watch {
+      let url = resolve(entry, relativeTo: root)
+      guard FileManager.default.fileExists(atPath: url.path) else {
+        throw HotReloadError("Watch path not found at \(url.path)")
+      }
+      if !watchTargets.contains(url) {
+        watchTargets.append(url)
+      }
+    }
+    if watchTargets.isEmpty {
+      watchTargets.append(projectURL.deletingLastPathComponent().standardizedFileURL)
     }
 
     let sessionURL = derivedDataURL.appending(
@@ -63,42 +86,32 @@ struct HotReloadCommand: AsyncParsableCommand {
     defer { signalSources.forEach { $0.cancel() } }
 
     let deviceID = try simulator ?? Self.bootedSimulatorID()
+    var watcher = SourceTreeWatcher(roots: watchTargets, excludedRoot: derivedDataURL)
     var session = Session(
       project: projectURL,
       scheme: scheme,
-      source: sourceURL,
       derivedData: derivedDataURL,
       deviceID: deviceID,
       sessionDirectory: sessionURL,
       runsXcodeGen: xcodegen,
       usesProjectBuildSettings: useProjectBuildSettings
     )
-    try session.bootstrap()
+    let initialFiles = try watcher.snapshotAllFiles()
+    try session.bootstrap(initialSources: initialFiles)
 
-    print("[hotreload] watching \(sourceURL.path) (Ctrl-C to stop)")
-    var lastSeenSource = try String(contentsOf: sourceURL, encoding: .utf8)
+    let watchedDescription = watchTargets.map(\.path).joined(separator: ", ")
+    print("[hotreload] watching \(watchedDescription) (\(initialFiles.count) Swift file(s), Ctrl-C to stop)")
 
     while true {
       try await Task.sleep(for: .milliseconds(150))
-      guard let initialRead = try? String(contentsOf: sourceURL, encoding: .utf8),
-        !initialRead.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-        initialRead != lastSeenSource
-      else { continue }
-
-      var edited = initialRead
-      for _ in 0..<6 {
-        try await Task.sleep(for: .milliseconds(50))
-        guard let latest = try? String(contentsOf: sourceURL, encoding: .utf8),
-          !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { break }
-        if latest == edited { break }
-        edited = latest
-      }
-      guard edited != lastSeenSource else { continue }
-      lastSeenSource = edited
-
+      guard let batch = try await watcher.pollSettledChanges() else { continue }
       do {
-        try session.apply(editedSource: edited)
+        let rebuilt = try session.applyBatch(batch)
+        if rebuilt {
+          if let refreshed = try? watcher.snapshotAllFiles() {
+            session.replaceAllBaselines(with: refreshed)
+          }
+        }
       } catch {
         print("[hotreload] \(error)")
       }
@@ -133,10 +146,208 @@ struct HotReloadCommand: AsyncParsableCommand {
   }
 }
 
+private struct SourceBatch {
+  var structuralFileSetChangeReason: String?
+  var changedFiles: [(url: URL, content: String)]
+}
+
+private struct SourceTreeWatcher {
+  let roots: [URL]
+  let excludedRoot: URL
+
+  private struct FileStamp: Equatable {
+    let modificationDate: Date?
+    let fileSize: Int?
+  }
+
+  private static let ignoredDirectoryNames: Set<String> = [
+    ".build", ".git", ".swiftpm", ".hotreload", ".lab-build", ".lab-output",
+    "DerivedData", "build", "Build", "Carthage", "Pods", "SourcePackages",
+    "xcuserdata", "node_modules", "prototypes", "tools", "scripts", "docs",
+  ]
+
+  private var stamps: [URL: FileStamp] = [:]
+  private var lastSeenContents: [URL: String] = [:]
+
+  init(roots: [URL], excludedRoot: URL) {
+    self.roots = roots.map(\.standardizedFileURL)
+    self.excludedRoot = excludedRoot.standardizedFileURL
+  }
+
+  mutating func snapshotAllFiles() throws -> [URL: String] {
+    let discovered = discoverFiles()
+    var result: [URL: String] = [:]
+    var nextStamps: [URL: FileStamp] = [:]
+    for (url, stamp) in discovered {
+      guard let content = try? String(contentsOf: url, encoding: .utf8) else { continue }
+      result[url] = content
+      nextStamps[url] = stamp
+    }
+    stamps = nextStamps
+    lastSeenContents = result
+    if result.isEmpty {
+      throw HotReloadError("No Swift source files found under \(roots.map(\.path).joined(separator: ", "))")
+    }
+    return result
+  }
+
+  mutating func pollSettledChanges() async throws -> SourceBatch? {
+    let firstScan = scanDelta()
+    guard firstScan.hasChanges else { return nil }
+
+    var latestScan = firstScan
+    for _ in 0..<8 {
+      try await Task.sleep(for: .milliseconds(55))
+      let nextScan = scanDelta()
+      if nextScan == latestScan {
+        break
+      }
+      latestScan = nextScan
+    }
+
+    guard latestScan.hasChanges else { return nil }
+
+    stamps = latestScan.currentStamps
+    for (url, content) in latestScan.changedContents {
+      lastSeenContents[url] = content
+    }
+    for removed in latestScan.removedURLs {
+      lastSeenContents.removeValue(forKey: removed)
+    }
+
+    let orderedChanges = latestScan.changedContents.keys
+      .sorted { $0.path < $1.path }
+      .compactMap { url -> (url: URL, content: String)? in
+        guard let content = latestScan.changedContents[url] else { return nil }
+        return (url: url, content: content)
+      }
+
+    var structuralReason: String?
+    if !latestScan.addedURLs.isEmpty {
+      let names = latestScan.addedURLs.map(\.lastPathComponent).sorted().joined(separator: ", ")
+      structuralReason = "Added Swift file(s): \(names)"
+    } else if !latestScan.removedURLs.isEmpty {
+      let names = latestScan.removedURLs.map(\.lastPathComponent).sorted().joined(separator: ", ")
+      structuralReason = "Removed Swift file(s): \(names)"
+    }
+
+    return SourceBatch(
+      structuralFileSetChangeReason: structuralReason,
+      changedFiles: orderedChanges
+    )
+  }
+
+  private struct ScanDelta: Equatable {
+    var currentStamps: [URL: FileStamp]
+    var addedURLs: Set<URL>
+    var removedURLs: Set<URL>
+    var changedContents: [URL: String]
+
+    var hasChanges: Bool {
+      !addedURLs.isEmpty || !removedURLs.isEmpty || !changedContents.isEmpty
+    }
+  }
+
+  private func scanDelta() -> ScanDelta {
+    let discovered = discoverFiles()
+    let previousKeys = Set(lastSeenContents.keys)
+    let currentKeys = Set(discovered.keys)
+
+    let added = currentKeys.subtracting(previousKeys)
+    let removed = previousKeys.subtracting(currentKeys)
+    var changed: [URL: String] = [:]
+
+    let isSingleFileMode = roots.count == 1 && currentKeys.count == 1
+    for (url, stamp) in discovered {
+      let stampChanged = isSingleFileMode || stamps[url] != stamp || added.contains(url)
+      guard stampChanged else { continue }
+      guard let content = try? String(contentsOf: url, encoding: .utf8),
+        !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      else { continue }
+      if content != lastSeenContents[url] {
+        changed[url] = content
+      }
+    }
+
+    return ScanDelta(
+      currentStamps: discovered,
+      addedURLs: added,
+      removedURLs: removed,
+      changedContents: changed
+    )
+  }
+
+  private func discoverFiles() -> [URL: FileStamp] {
+    let fm = FileManager.default
+    var files: [URL: FileStamp] = [:]
+    let resourceKeys: Set<URLResourceKey> = [
+      .isDirectoryKey, .contentModificationDateKey, .fileSizeKey,
+    ]
+
+    for root in roots {
+      var isDir: ObjCBool = false
+      guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else { continue }
+      if !isDir.boolValue {
+        if root.pathExtension == "swift" {
+          let values = try? root.resourceValues(forKeys: resourceKeys)
+          files[root] = FileStamp(
+            modificationDate: values?.contentModificationDate,
+            fileSize: values?.fileSize
+          )
+        }
+        continue
+      }
+
+      guard
+        let enumerator = fm.enumerator(
+          at: root,
+          includingPropertiesForKeys: Array(resourceKeys),
+          options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        )
+      else { continue }
+
+      for case let fileURL as URL in enumerator {
+        let standardized = fileURL.standardizedFileURL
+        if standardized.path.hasPrefix(excludedRoot.path) {
+          enumerator.skipDescendants()
+          continue
+        }
+        let values = try? standardized.resourceValues(forKeys: resourceKeys)
+        if values?.isDirectory == true {
+          let name = standardized.lastPathComponent
+          if Self.shouldIgnoreDirectory(named: name) {
+            enumerator.skipDescendants()
+          }
+          continue
+        }
+        guard standardized.pathExtension == "swift",
+          standardized.lastPathComponent != "Package.swift"
+        else { continue }
+        files[standardized] = FileStamp(
+          modificationDate: values?.contentModificationDate,
+          fileSize: values?.fileSize
+        )
+      }
+    }
+    return files
+  }
+
+  private static func shouldIgnoreDirectory(named name: String) -> Bool {
+    if name.hasPrefix(".") { return true }
+    if ignoredDirectoryNames.contains(name) { return true }
+    if name.hasSuffix("Tests") || name.hasSuffix(".xcodeproj") || name.hasSuffix(".xcworkspace")
+      || name.hasSuffix(".xcassets") || name.hasSuffix(".xcresult") || name.hasSuffix(".bundle")
+      || name.hasSuffix(".app") || name.hasSuffix(".framework") || name.hasSuffix(".dSYM")
+    {
+      return true
+    }
+    return false
+  }
+}
+
 private struct Session {
   let project: URL
   let scheme: String
-  let source: URL
   let derivedData: URL
   let deviceID: String
   let sessionDirectory: URL
@@ -147,14 +358,13 @@ private struct Session {
   private var receipt: URL { sessionDirectory.appending(path: "receipt.json") }
   private var projectDirectory: URL { project.deletingLastPathComponent() }
 
-  private var baseline = ""
+  private var baselines: [URL: String] = [:]
   private var settings: BuildSettings?
   private var generation = 0
 
   init(
     project: URL,
     scheme: String,
-    source: URL,
     derivedData: URL,
     deviceID: String,
     sessionDirectory: URL,
@@ -163,7 +373,6 @@ private struct Session {
   ) {
     self.project = project
     self.scheme = scheme
-    self.source = source
     self.derivedData = derivedData
     self.deviceID = deviceID
     self.sessionDirectory = sessionDirectory
@@ -171,61 +380,116 @@ private struct Session {
     self.usesProjectBuildSettings = usesProjectBuildSettings
   }
 
-  mutating func bootstrap() throws {
-    baseline = try String(contentsOf: source, encoding: .utf8)
-    if !ReplacementPlanner.hasSingleReloadableBody(in: baseline) {
+  mutating func bootstrap(initialSources: [URL: String]) throws {
+    baselines = initialSources
+    if initialSources.count == 1, let (url, source) = initialSources.first,
+      !ReplacementPlanner.hasReloadableDeclarations(in: source)
+    {
       print(
-        "[hotreload] warning: \(source.lastPathComponent) does not have a single reloadable body; edits will trigger full rebuilds"
+        "[hotreload] warning: \(url.lastPathComponent) has no reloadable declarations; edits will trigger full rebuilds"
       )
     }
     try buildAndLaunch()
     print("[hotreload] baseline app is running")
   }
 
-  mutating func apply(editedSource: String) throws {
+  mutating func replaceAllBaselines(with updated: [URL: String]) {
+    baselines = updated
+  }
+
+  @discardableResult
+  mutating func applyBatch(_ batch: SourceBatch) throws -> Bool {
     guard let settings else { throw HotReloadError("Build settings are unavailable") }
-    if generation == 0, editedSource == baseline {
-      print("[hotreload] source matches running baseline")
-      return
+
+    if let structuralReason = batch.structuralFileSetChangeReason {
+      print("[hotreload] rebuilding: \(structuralReason)")
+      try buildAndLaunch()
+      for (url, content) in batch.changedFiles {
+        baselines[url] = content
+      }
+      print("[hotreload] rebuilt and relaunched")
+      return true
     }
+
+    guard !batch.changedFiles.isEmpty else { return false }
+
+    if generation == 0,
+      batch.changedFiles.allSatisfy({ baselines[$0.url] == $0.content })
+    {
+      print("[hotreload] source matches running baseline")
+      return false
+    }
+
     let nextGeneration = generation + 1
-    let plan = try ReplacementPlanner.plan(
-      baseline: baseline,
-      edited: editedSource,
-      module: settings.moduleName,
-      sourceFile: source.lastPathComponent,
-      generation: nextGeneration
-    )
+    var replacements: [(url: URL, replacement: Replacement)] = []
+    var rebuildReason: String?
 
-    switch plan {
-    case .replace(let replacement):
-      if generation > 0, generation.isMultiple(of: 50) {
-        print("[hotreload] rebuilding to reclaim loaded replacement images")
-        try buildAndLaunch()
-        baseline = editedSource
-        return
+    for (url, editedSource) in batch.changedFiles {
+      guard let baselineSource = baselines[url] else {
+        rebuildReason = "New file \(url.lastPathComponent) requires a rebuild"
+        break
       }
-      let startedAt = ContinuousClock.now
-      let artifact = try compile(
-        replacement: replacement, generation: nextGeneration, settings: settings)
-      defer { try? FileManager.default.removeItem(at: artifact) }
-      generation = nextGeneration
-      try publish(artifact: artifact, declaration: replacement.declaration)
-      let receipt = try waitForReceipt(generation: generation)
-      if let error = receipt.error {
-        throw HotReloadError("Runtime rejected generation \(generation): \(error)")
-      }
-      let duration = startedAt.duration(to: .now)
-      print(
-        "[hotreload] generation \(generation) visible in \(duration.formatted(.units(allowed: [.seconds, .milliseconds])))"
+      let plan = try ReplacementPlanner.plan(
+        baseline: baselineSource,
+        edited: editedSource,
+        module: settings.moduleName,
+        sourceFile: url.lastPathComponent,
+        generation: nextGeneration
       )
+      switch plan {
+      case .replace(let replacement):
+        replacements.append((url: url, replacement: replacement))
+      case .rebuild(let reason):
+        rebuildReason =
+          batch.changedFiles.count > 1 ? "\(url.lastPathComponent): \(reason)" : reason
+      }
+      if rebuildReason != nil { break }
+    }
 
-    case .rebuild(let reason):
+    if let reason = rebuildReason {
       print("[hotreload] rebuilding: \(reason)")
       try buildAndLaunch()
-      baseline = editedSource
+      for (url, content) in batch.changedFiles {
+        baselines[url] = content
+      }
       print("[hotreload] rebuilt and relaunched")
+      return true
     }
+
+    if generation > 0, generation.isMultiple(of: 50) {
+      print("[hotreload] rebuilding to reclaim loaded replacement images")
+      try buildAndLaunch()
+      for (url, content) in batch.changedFiles {
+        baselines[url] = content
+      }
+      return true
+    }
+
+    let startedAt = ContinuousClock.now
+    let artifact = try compileBatch(
+      replacements: replacements,
+      generation: nextGeneration,
+      settings: settings
+    )
+    defer { try? FileManager.default.removeItem(at: artifact) }
+    generation = nextGeneration
+
+    var allDeclarations: [String] = []
+    for (_, replacement) in replacements {
+      for decl in replacement.declarations where !allDeclarations.contains(decl) {
+        allDeclarations.append(decl)
+      }
+    }
+
+    try publish(artifact: artifact, declarations: allDeclarations)
+    let receipt = try waitForReceipt(generation: generation)
+    if let error = receipt.error {
+      throw HotReloadError("Runtime rejected generation \(generation): \(error)")
+    }
+    let duration = startedAt.duration(to: .now)
+    let formattedDuration = duration.formatted(.units(allowed: [.seconds, .milliseconds]))
+    print("[hotreload] generation \(generation) visible in \(formattedDuration)")
+    return false
   }
 
   private mutating func buildAndLaunch() throws {
@@ -310,9 +574,11 @@ private struct Session {
     ]
   }
 
-  private func compile(replacement: Replacement, generation: Int, settings: BuildSettings) throws
-    -> URL
-  {
+  private func compileBatch(
+    replacements: [(url: URL, replacement: Replacement)],
+    generation: Int,
+    settings: BuildSettings
+  ) throws -> URL {
     let artifactDirectory = sessionDirectory.appending(
       path: "Artifacts", directoryHint: .isDirectory)
     try FileManager.default.createDirectory(
@@ -320,37 +586,53 @@ private struct Session {
       withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o700]
     )
-    let base = "\(source.deletingPathExtension().lastPathComponent).\(generation)"
-    let thunk = artifactDirectory.appending(path: "\(base).swift")
-    let object = artifactDirectory.appending(path: "\(base).o")
-    let bundle = artifactDirectory.appending(path: "\(base).bundle")
-    defer {
-      try? FileManager.default.removeItem(at: thunk)
-      try? FileManager.default.removeItem(at: object)
-    }
-    try replacement.source.write(to: thunk, atomically: true, encoding: .utf8)
 
-    var compilerArguments =
-      [
-        "--sdk", "iphonesimulator", "swiftc",
-        "-emit-object", "-parse-as-library",
-        "-module-name", "HotReloadThunk_\(generation)",
-        thunk.path,
-        "-o", object.path,
-        "-target", "\(settings.architecture)-apple-ios\(settings.deploymentTarget)-simulator",
-        "-swift-version", settings.swiftVersion,
-        "-sdk", settings.sdk,
-        "-I", settings.targetBuildDirectory.path,
-      ] + settings.frameworkSearchFlags
-      + settings.compilationConditions.flatMap { ["-D", $0] }
-      + settings.compilerArguments
-    if let strictConcurrency = settings.strictConcurrency {
-      compilerArguments += ["-Xfrontend", "-strict-concurrency=\(strictConcurrency.lowercased())"]
+    var tempFiles: [URL] = []
+    var objectPaths: [String] = []
+    defer {
+      for file in tempFiles {
+        try? FileManager.default.removeItem(at: file)
+      }
     }
-    try ProcessRunner.run(
-      "xcrun",
-      compilerArguments
-    )
+
+    for (index, item) in replacements.enumerated() {
+      let stem = item.url.deletingPathExtension().lastPathComponent
+      let base = replacements.count > 1 ? "\(stem).\(index).\(generation)" : "\(stem).\(generation)"
+      let moduleName =
+        replacements.count > 1
+        ? "HotReloadThunk_\(generation)_\(index)" : "HotReloadThunk_\(generation)"
+      let thunk = artifactDirectory.appending(path: "\(base).swift")
+      let object = artifactDirectory.appending(path: "\(base).o")
+      tempFiles.append(thunk)
+      tempFiles.append(object)
+
+      try item.replacement.source.write(to: thunk, atomically: true, encoding: .utf8)
+
+      var compilerArguments =
+        [
+          "--sdk", "iphonesimulator", "swiftc",
+          "-emit-object", "-parse-as-library",
+          "-module-name", moduleName,
+          thunk.path,
+          "-o", object.path,
+          "-target", "\(settings.architecture)-apple-ios\(settings.deploymentTarget)-simulator",
+          "-swift-version", settings.swiftVersion,
+          "-sdk", settings.sdk,
+          "-I", settings.targetBuildDirectory.path,
+        ] + settings.frameworkSearchFlags
+        + settings.compilationConditions.flatMap { ["-D", $0] }
+        + settings.compilerArguments
+      if let strictConcurrency = settings.strictConcurrency {
+        compilerArguments += ["-Xfrontend", "-strict-concurrency=\(strictConcurrency.lowercased())"]
+      }
+      try ProcessRunner.run("xcrun", compilerArguments)
+      objectPaths.append(object.path)
+    }
+
+    let firstStem = replacements[0].url.deletingPathExtension().lastPathComponent
+    let bundleName =
+      replacements.count > 1 ? "Batch.\(generation).bundle" : "\(firstStem).\(generation).bundle"
+    let bundle = artifactDirectory.appending(path: bundleName)
 
     try ProcessRunner.run(
       "xcrun",
@@ -365,16 +647,17 @@ private struct Session {
         "-rpath", "/usr/lib/swift",
       ] + settings.frameworkSearchFlags + [
         "-o", bundle.path,
-        object.path,
-      ])
+      ] + objectPaths)
     return bundle
   }
 
-  private func publish(artifact: URL, declaration: String) throws {
+  private func publish(artifact: URL, declarations: [String]) throws {
+    let primary = declarations.first ?? ""
     let command = ReloadCommand(
       generation: generation,
       artifactPath: artifact.path,
-      declaration: declaration
+      declaration: primary,
+      declarations: declarations
     )
     try JSONEncoder().encode(command).write(to: manifest, options: .atomic)
   }
@@ -449,15 +732,48 @@ private struct BuildSettings {
     var swiftArgs =
       Self.arguments(in: values["OTHER_SWIFT_FLAGS"])
       + Self.searchPaths(in: values["SWIFT_INCLUDE_PATHS"], flag: "-I")
+    let includeDirectory = targetBuildDirectory.appending(
+      path: "include", directoryHint: .isDirectory)
+    if FileManager.default.fileExists(atPath: includeDirectory.path) {
+      swiftArgs += ["-I", includeDirectory.path, "-Xcc", "-I\(includeDirectory.path)"]
+    }
+    if let objectDirNormal = values["OBJECT_FILE_DIR_normal"] {
+      let archObjectDir = URL(fileURLWithPath: objectDirNormal)
+        .appending(path: architecture, directoryHint: .isDirectory)
+      if FileManager.default.fileExists(atPath: archObjectDir.path) {
+        swiftArgs += ["-I", archObjectDir.path]
+      }
+    }
     if values["SWIFT_DEFAULT_ACTOR_ISOLATION"] == "MainActor",
       !swiftArgs.contains("-default-isolation=MainActor")
     {
       swiftArgs += ["-default-isolation=MainActor"]
     }
+    if values["SWIFT_APPROACHABLE_CONCURRENCY"] == "YES" {
+      if !swiftArgs.contains("InferIsolatedConformances") {
+        swiftArgs += ["-enable-upcoming-feature", "InferIsolatedConformances"]
+      }
+      if !swiftArgs.contains("NonisolatedNonsendingByDefault") {
+        swiftArgs += ["-enable-upcoming-feature", "NonisolatedNonsendingByDefault"]
+      }
+    }
     if values["SWIFT_ENABLE_OPAQUE_TYPE_ERASURE"] == "YES",
       !swiftArgs.contains("OpaqueTypeErasure")
     {
       swiftArgs += ["-enable-experimental-feature", "OpaqueTypeErasure"]
+    }
+    if let bridgingHeader = values["SWIFT_OBJC_BRIDGING_HEADER"],
+      !bridgingHeader.isEmpty,
+      !swiftArgs.contains("-import-objc-header")
+    {
+      let srcRoot = URL(
+        fileURLWithPath: values["SRCROOT"] ?? values["PROJECT_DIR"]
+          ?? FileManager.default.currentDirectoryPath
+      )
+      let headerURL = resolve(bridgingHeader, relativeTo: srcRoot)
+      if FileManager.default.fileExists(atPath: headerURL.path) {
+        swiftArgs += ["-import-objc-header", headerURL.path]
+      }
     }
     compilerArguments = swiftArgs
 

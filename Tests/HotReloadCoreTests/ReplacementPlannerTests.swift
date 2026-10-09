@@ -273,3 +273,221 @@ func localBodyVariableInMethodIsIgnored() throws {
   #expect(replacement.declaration == "GreetingView")
   #expect(replacement.source.contains("Text(\"After\")"))
 }
+
+@Test("editing one view in a multi-view file emits a replacement for only that view")
+func multiBodyFileSingleEditProducesTargetedThunk() throws {
+  let baseline = """
+    import SwiftUI
+
+    private struct HeaderBadge: View {
+      var body: some View {
+        Text("Badge v1")
+      }
+    }
+
+    struct SessionScreen: View {
+      var body: some View {
+        VStack {
+          HeaderBadge()
+          Text("Session v1")
+        }
+      }
+    }
+    """
+  let edited = baseline.replacingOccurrences(of: "Session v1", with: "Session v2")
+
+  let plan = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: edited,
+    module: "ExampleApp",
+    sourceFile: "SessionView.swift",
+    generation: 2
+  )
+
+  guard case .replace(let replacement) = plan else {
+    Issue.record("Expected a targeted replacement thunk, got \(plan)")
+    return
+  }
+  #expect(replacement.declaration == "SessionScreen")
+  #expect(replacement.declarations == ["SessionScreen"])
+  #expect(replacement.source.contains("extension SessionScreen"))
+  #expect(!replacement.source.contains("extension HeaderBadge"))
+  #expect(replacement.source.contains("Text(\"Session v2\")"))
+}
+
+@Test("editing multiple views in a single file emits replacements for each changed view")
+func multiBodyFileMultipleEditsProduceCombinedThunk() throws {
+  let baseline = """
+    import SwiftUI
+
+    struct HeaderView: View {
+      var body: some View {
+        Text("Header 1")
+      }
+    }
+
+    struct FooterView: View {
+      var body: some View {
+        Text("Footer 1")
+      }
+    }
+    """
+  let edited =
+    baseline
+    .replacingOccurrences(of: "Header 1", with: "Header 2")
+    .replacingOccurrences(of: "Footer 1", with: "Footer 2")
+
+  let plan = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: edited,
+    module: "ExampleApp",
+    sourceFile: "ChromeViews.swift",
+    generation: 4
+  )
+
+  guard case .replace(let replacement) = plan else {
+    Issue.record("Expected combined replacement thunk")
+    return
+  }
+  #expect(replacement.declarations == ["HeaderView", "FooterView"])
+  #expect(replacement.source.contains("extension HeaderView"))
+  #expect(replacement.source.contains("extension FooterView"))
+}
+
+@Test("a class method body edit produces a dynamic replacement thunk stripping default arguments")
+func classMethodBodyEditProducesThunk() throws {
+  let baseline = """
+    import UIKit
+
+    final class TranscriptListViewController: UIViewController {
+      private var headerHeight: CGFloat = 44
+
+      private func configureHeader(animated: Bool = false, inset: CGFloat) -> CGFloat {
+        headerHeight = inset + (animated ? 8 : 0)
+        return headerHeight
+      }
+
+      nonisolated private static func clamp(_ value: CGFloat) -> CGFloat {
+        max(0, value)
+      }
+    }
+    """
+  let edited = baseline.replacingOccurrences(
+    of: "headerHeight = inset + (animated ? 8 : 0)",
+    with: "headerHeight = inset + (animated ? 16 : 4)"
+  )
+
+  let plan = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: edited,
+    module: "OpenCode",
+    sourceFile: "TranscriptListViewController.swift",
+    generation: 5
+  )
+
+  guard case .replace(let replacement) = plan else {
+    Issue.record("Expected class method replacement, got \(plan)")
+    return
+  }
+  #expect(replacement.declaration == "TranscriptListViewController")
+  #expect(replacement.source.contains("@_dynamicReplacement(for: configureHeader(animated:inset:))"))
+  #expect(
+    replacement.source.contains(
+      "func __hotReload_configureHeader_5(animated: Bool, inset: CGFloat) -> CGFloat"
+    ))
+  #expect(replacement.source.contains("headerHeight = inset + (animated ? 16 : 4)"))
+}
+
+@Test("changing a class method signature or @objc attribute requires a rebuild")
+func classMethodSignatureOrObjcChangeRequiresRebuild() throws {
+  let baseline = """
+    import UIKit
+
+    final class CardView: UIView {
+      func refreshLayout() {
+        setNeedsLayout()
+      }
+    }
+    """
+  let withObjc = baseline.replacingOccurrences(
+    of: "func refreshLayout()",
+    with: "@objc func refreshLayout()"
+  )
+  let planObjc = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: withObjc,
+    module: "ExampleApp",
+    sourceFile: "CardView.swift",
+    generation: 1
+  )
+  #expect(planObjc == .rebuild(reason: "The edit changes code outside the computed body"))
+
+  let withParam = baseline.replacingOccurrences(
+    of: "func refreshLayout()",
+    with: "func refreshLayout(force: Bool)"
+  )
+  let planParam = try ReplacementPlanner.plan(
+    baseline: baseline,
+    edited: withParam,
+    module: "ExampleApp",
+    sourceFile: "CardView.swift",
+    generation: 1
+  )
+  #expect(planParam == .rebuild(reason: "The edit changes code outside the computed body"))
+}
+
+@Test("generic classes, generic class methods, and ambiguous overloads require a rebuild")
+func unsafeClassMethodFormsRequireRebuild() throws {
+  let genericClassBase = """
+    import UIKit
+    final class BoxController<T>: UIViewController {
+      func configure() { view.alpha = 1 }
+    }
+    """
+  let genericClassEdit = genericClassBase.replacingOccurrences(of: "alpha = 1", with: "alpha = 0.5")
+  #expect(
+    try ReplacementPlanner.plan(
+      baseline: genericClassBase,
+      edited: genericClassEdit,
+      module: "ExampleApp",
+      sourceFile: "BoxController.swift",
+      generation: 1
+    ) == .rebuild(reason: "Generic classes require a rebuild")
+  )
+
+  let genericMethodBase = """
+    import UIKit
+    final class ListController: UIViewController {
+      func render<T>(_ item: T) -> String { "\\(item)" }
+    }
+    """
+  let genericMethodEdit = genericMethodBase.replacingOccurrences(
+    of: "\"\\(item)\"", with: "\"item:\\(item)\"")
+  #expect(
+    try ReplacementPlanner.plan(
+      baseline: genericMethodBase,
+      edited: genericMethodEdit,
+      module: "ExampleApp",
+      sourceFile: "ListController.swift",
+      generation: 1
+    ) == .rebuild(reason: "Generic class methods require a rebuild")
+  )
+
+  let overloadedBase = """
+    import UIKit
+    final class ListController: UIViewController {
+      func apply(_ value: Int) -> Int { value + 1 }
+      func apply(_ value: String) -> String { value }
+    }
+    """
+  let overloadedEdit = overloadedBase.replacingOccurrences(of: "value + 1", with: "value + 2")
+  #expect(
+    try ReplacementPlanner.plan(
+      baseline: overloadedBase,
+      edited: overloadedEdit,
+      module: "ExampleApp",
+      sourceFile: "ListController.swift",
+      generation: 1
+    ) == .rebuild(reason: "Overloaded methods with identical argument labels require a rebuild")
+  )
+}

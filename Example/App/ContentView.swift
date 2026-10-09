@@ -19,6 +19,11 @@ struct ContentView: View {
         store.send(.increment)
       }
       .buttonStyle(.borderedProminent)
+
+      Divider()
+
+      UIKitPreviewSection()
+        .frame(height: 150)
     }
     .padding(32)
   }

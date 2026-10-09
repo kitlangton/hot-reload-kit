@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 view_file="$root/Example/App/ContentView.swift"
 reducer_file="$root/Example/App/CounterFeature.swift"
+uikit_file="$root/Example/App/UIKitPreviewViewController.swift"
 log_file="${TMPDIR:-/tmp}/hot-reload-kit-example.log"
 derived_data="${HOTRELOAD_DERIVED_DATA:-${TMPDIR:-/tmp}/HotReloadKitExampleSmoke}"
 xcodegen_bin="${XCODEGEN_BIN:-$(command -v xcodegen || true)}"
@@ -16,8 +17,10 @@ if [[ -z "$xcodegen_bin" ]]; then
 fi
 view_backup="$(mktemp)"
 reducer_backup="$(mktemp)"
+uikit_backup="$(mktemp)"
 cp "$view_file" "$view_backup"
 cp "$reducer_file" "$reducer_backup"
+cp "$uikit_file" "$uikit_backup"
 rm -rf "$derived_data"
 
 daemon_pid=""
@@ -33,7 +36,8 @@ cleanup() {
   stop_daemon
   cp "$view_backup" "$view_file"
   cp "$reducer_backup" "$reducer_file"
-  rm -f "$view_backup" "$reducer_backup"
+  cp "$uikit_backup" "$uikit_file"
+  rm -f "$view_backup" "$reducer_backup" "$uikit_backup"
 }
 trap cleanup EXIT
 
@@ -84,9 +88,10 @@ hotreload_bin="$root/.build/debug/hotreload"
 "$hotreload_bin" \
   --project Example/HotReloadExample.xcodeproj \
   --scheme HotReloadExample \
-  --source Example/App/ContentView.swift \
+  --watch Example/App \
   --simulator "$device_id" \
   --derived-data "$derived_data" \
+  --use-project-build-settings \
   >"$log_file" 2>&1 &
 daemon_pid=$!
 
@@ -94,24 +99,11 @@ wait_for_log "[hotreload] watching"
 perl -0pi -e 's/Text\("SwiftUI and TCA"\)/Text("Hot Reloaded SwiftUI")/' "$view_file"
 wait_for_log "generation 1 visible"
 
-receipt="$(find "$derived_data" -path '*/HotReloadSession-*/receipt.json' -print -quit)"
-jq -e '.generation == 1 and .error == null' "$receipt" >/dev/null
-stop_daemon
-cp "$view_backup" "$view_file"
-
-: >"$log_file"
-"$hotreload_bin" \
-  --project Example/HotReloadExample.xcodeproj \
-  --scheme HotReloadExample \
-  --source Example/App/CounterFeature.swift \
-  --simulator "$device_id" \
-  --derived-data "$derived_data" \
-  >"$log_file" 2>&1 &
-daemon_pid=$!
-
-wait_for_log "[hotreload] watching"
 perl -0pi -e 's/state\.count \+= 1/state.count += 2/' "$reducer_file"
-wait_for_log "generation 1 visible"
+wait_for_log "generation 2 visible"
+
+perl -0pi -e 's/UIKit Hook Active/UIKit Hook Reloaded/' "$uikit_file"
+wait_for_log "generation 3 visible"
 
 printf '\n// Structural rebuild smoke marker.\n' >>"$reducer_file"
 wait_for_log "rebuilt and relaunched"
