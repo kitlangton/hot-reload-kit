@@ -29,6 +29,9 @@ struct HotReloadCommand: AsyncParsableCommand {
   @Flag(help: "Run xcodegen before the initial build and structural rebuilds.")
   var xcodegen = false
 
+  @Flag(help: "Use hot-reload compiler and linker settings already defined by the application target.")
+  var useProjectBuildSettings = false
+
   mutating func run() async throws {
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     let projectURL = resolve(project, relativeTo: root)
@@ -49,7 +52,8 @@ struct HotReloadCommand: AsyncParsableCommand {
       derivedData: derivedDataURL,
       deviceID: deviceID,
       sessionDirectory: sessionURL,
-      runsXcodeGen: xcodegen
+      runsXcodeGen: xcodegen,
+      usesProjectBuildSettings: useProjectBuildSettings
     )
     try session.bootstrap()
 
@@ -92,6 +96,7 @@ private struct Session {
   let deviceID: String
   let sessionDirectory: URL
   let runsXcodeGen: Bool
+  let usesProjectBuildSettings: Bool
 
   private var manifest: URL { sessionDirectory.appending(path: "manifest.json") }
   private var receipt: URL { sessionDirectory.appending(path: "receipt.json") }
@@ -108,7 +113,8 @@ private struct Session {
     derivedData: URL,
     deviceID: String,
     sessionDirectory: URL,
-    runsXcodeGen: Bool
+    runsXcodeGen: Bool,
+    usesProjectBuildSettings: Bool
   ) {
     self.project = project
     self.scheme = scheme
@@ -117,6 +123,7 @@ private struct Session {
     self.deviceID = deviceID
     self.sessionDirectory = sessionDirectory
     self.runsXcodeGen = runsXcodeGen
+    self.usesProjectBuildSettings = usesProjectBuildSettings
   }
 
   mutating func bootstrap() throws {
@@ -176,12 +183,15 @@ private struct Session {
     try? FileManager.default.removeItem(at: manifest)
     try? FileManager.default.removeItem(at: receipt)
 
+    print("[hotreload] preparing simulator")
     try ProcessRunner.run("xcrun", ["simctl", "boot", deviceID], quiet: true, allowFailure: true)
     try ProcessRunner.run("xcrun", ["simctl", "bootstatus", deviceID, "-b"], quiet: true)
+    print("[hotreload] building baseline")
     try ProcessRunner.run(
       "xcodebuild", buildArguments(command: "build"), directory: projectDirectory
     )
 
+    print("[hotreload] reading build settings")
     let settingsJSON = try ProcessRunner.capture(
       "xcodebuild",
       buildArguments(command: "-showBuildSettings") + ["-json"],
@@ -203,6 +213,7 @@ private struct Session {
     let buildSettings = try BuildSettings(values: values, sdk: sdk, swiftc: swiftc)
     settings = buildSettings
 
+    print("[hotreload] installing baseline")
     try ProcessRunner.run(
       "xcrun", ["simctl", "install", deviceID, buildSettings.app.path], quiet: true)
     try ProcessRunner.run(
@@ -216,17 +227,21 @@ private struct Session {
       ],
       quiet: true
     )
+    print("[hotreload] launched baseline")
     generation = 0
   }
 
   private func buildArguments(command: String) -> [String] {
-    [
+    let base = [
       command,
       "-quiet",
       "-project", project.path,
       "-scheme", scheme,
       "-derivedDataPath", derivedData.path,
       "-destination", "platform=iOS Simulator,id=\(deviceID)",
+    ]
+    if usesProjectBuildSettings { return base }
+    return base + [
       "ENABLE_DEBUG_DYLIB=NO",
       "SWIFT_ENABLE_OPAQUE_TYPE_ERASURE=YES",
       "OTHER_SWIFT_FLAGS=$(inherited) -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-private-imports",

@@ -103,6 +103,11 @@ ENABLE_DEBUG_DYLIB=NO
 -Xlinker -export_dynamic
 ```
 
+If the application target already defines all of these settings, pass
+`--use-project-build-settings` to avoid applying command-line overrides to every
+Swift package target. This keeps the baseline build incremental in projects
+with substantial package dependency graphs.
+
 Use `hotreload --help` for all options, including an explicit simulator UDID and DerivedData directory.
 
 ## Safety model
