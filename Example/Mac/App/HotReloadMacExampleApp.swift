@@ -3,6 +3,10 @@ import SwiftUI
 
 @main
 struct HotReloadMacExampleApp: App {
+  init() {
+    HotReloadRuntime.start()
+  }
+
   var body: some Scene {
     WindowGroup("HotReloadKit on macOS") {
       ContentView()
