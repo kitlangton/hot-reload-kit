@@ -7,8 +7,9 @@ HotReloadKit has one external seam: a developer runs `hotreload` against a proje
 ### HotReloadCore
 
 `ReplacementPlanner` parses baseline and edited source with `SwiftSyntax`. It collects all reloadable units in the file:
-- computed `body` getters on `struct` declarations (supporting files with dozens of `View` or `Reducer` types), and
-- method bodies on top-level `class` declarations (`UIViewController`, `UIView`, etc.).
+- computed `body` getters on `struct` declarations (supporting files with dozens of `View` or `Reducer` types),
+- other get-only computed properties on top-level structs and classes (SwiftUI helpers such as `private var sidebar: some View`; non-`View` opaque types rebuild), and
+- method bodies on top-level `class` declarations (`UIViewController`, `NSView`, etc.) and `struct` declarations (including `mutating`).
 
 It compares baseline and edited files after replacing all reloadable unit bodies with `{}`. For non-`View` opaque return types (such as TCA reducers), it also verifies that edits remain inside `Reduce { ... }` closure bodies so the underlying opaque return type does not change.
 

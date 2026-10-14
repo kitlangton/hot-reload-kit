@@ -20,7 +20,7 @@ HotReloadKit builds on ideas pioneered by:
 ## How it works
 
 1. **Baseline build:** `hotreload` builds and launches your app in the iOS Simulator (or, with `--platform macos`, directly on the Mac) with `-enable-implicit-dynamic`, `-enable-private-imports`, and `-export_dynamic`, passing a per-session manifest and receipt path as environment variables (through `simctl launch` on iOS, to the launched process on macOS).
-2. **AST diffing (`HotReloadCore`):** On every save (or settled `rsync` batch), `ReplacementPlanner` parses the baseline and edited source for each changed file with `SwiftSyntax`. It verifies that edits are confined to `struct` computed `body` getters (any number of views/reducers per file) or `class` method bodies with unchanged signatures.
+2. **AST diffing (`HotReloadCore`):** On every save (or settled `rsync` batch), `ReplacementPlanner` parses the baseline and edited source for each changed file with `SwiftSyntax`. It verifies that edits are confined to `struct` computed `body` getters (any number of views/reducers per file), other get-only computed properties (such as `private var sidebar: some View`), or method bodies on classes and structs, all with unchanged signatures.
 3. **Thunk compilation:** Safe edits emit a replacement source file per changed file containing only the modified declarations:
    ```swift
    @_private(sourceFile: "SessionView.swift") import MyApp
@@ -370,6 +370,7 @@ It launches the Mac app, hot-reloads a SwiftUI body (`ContentView.swift`) and an
 | SwiftUI `View.body` in single-view or multi-view files (subviews, modifiers, `@ViewBuilder` branches, closures) | **Hot reloads in place** (~100–300 ms) | Yes (`@State`, `@StateObject`, `@Observable`, navigation) |
 | TCA `Reducer.body` statements inside `Reduce { state, action in ... }` | **Hot reloads in place** (~100–300 ms) | Yes (`Store` state and in-flight effects) |
 | Class method bodies (`func`, `private func`, `static func`, `override func`, `@objc func`) on non-generic top-level classes | **Hot reloads in place** (~100–300 ms) | Yes (fires `HotReloadRefreshing` / `onReload`) |
+| Get-only computed properties (`private var sidebar: some View { ... }`, `var title: String { get { ... } }`) and struct methods (including `mutating`) on non-generic top-level types | **Hot reloads in place** | Yes (a SwiftUI helper shows when its view's body runs again, e.g. under `@HotReloadable`) |
 | Syntax error or type/compiler error inside a body or method | **Rejected without publishing** | Yes (running app stays on last good generation) |
 | Changing TCA `@ReducerBuilder` composition outside `Reduce { ... }` (e.g., adding `Scope`, `.ifLet`, `.forEach`, `.onChange`) | **Automatic `xcodebuild` + relaunch** | No (clean relaunch) |
 | Adding/changing stored properties, method signatures, `@objc` attributes, generic methods/classes, or new files/types | **Automatic `xcodebuild` + relaunch** | No (clean relaunch) |
@@ -398,7 +399,7 @@ It launches the Mac app, hot-reloads a SwiftUI body (`ContentView.swift`) and an
 
 ## Limitations
 
-- **Top-level declarations only:** `struct` `body` properties and `class` methods must belong to top-level declarations (not types nested inside another `struct`, `enum`, or `class`). Editing a nested type falls back to a full rebuild.
+- **Top-level declarations only:** `body` and other computed properties, and methods, must belong to top-level declarations (not types nested inside another `struct`, `enum`, or `class`). Editing a nested type falls back to a full rebuild.
 - **iOS Simulator and Mac only:** Physical iOS devices do not share the host filesystem or permit arbitrary unsigned `dlopen` bundles; the runtime is compiled out on device targets. On macOS the runtime is Debug-only, and needs a Debug build without the hardened runtime's library validation.
 - **Resident replacement images:** The Swift runtime does not support unloading images (`dlclose`) that register Swift metadata or dynamic replacements. `hotreload` automatically performs a clean rebuild every 50 generations to reclaim loaded bundles.
 - **Underscored Swift features:** Dynamic replacement relies on `-Xfrontend -enable-implicit-dynamic`, `-Xfrontend -enable-private-imports`, `@_private(sourceFile:)`, and `@_dynamicReplacement(for:)`.
