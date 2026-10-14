@@ -81,8 +81,11 @@ fi
 xcrun simctl boot "$device_id" 2>/dev/null || true
 xcrun simctl bootstatus "$device_id" -b >/dev/null
 
-swift build --product hotreload
-hotreload_bin="$root/.build/debug/hotreload"
+hotreload_bin="${HOTRELOAD_BIN:-}"
+if [[ -z "$hotreload_bin" ]]; then
+  swift build --product hotreload
+  hotreload_bin="$root/.build/debug/hotreload"
+fi
 
 : >"$log_file"
 "$hotreload_bin" \
