@@ -1031,16 +1031,24 @@ private enum ProcessRunner {
 
 /// Owns the native macOS app process a `--platform macos` session launches.
 ///
-/// The app is executed directly (not through LaunchServices), so the session
-/// always knows the exact process it published replacements to, a second copy
-/// with the same bundle identifier never activates instead, and the app quits
-/// with the session.
+/// The app is spawned directly (not through LaunchServices), so the session
+/// always knows the exact process it published replacements to, and a second
+/// copy with the same bundle identifier never activates instead. It runs in its
+/// own session, so closing the terminal or SSH connection that started
+/// `hotreload` doesn't hang it up; the session terminates it on exit instead.
 private final class MacAppLauncher: @unchecked Sendable {
   private let lock = NSLock()
-  private var process: Process?
+  private var pid: pid_t?
 
   var isRunning: Bool {
-    lock.withLock { process?.isRunning ?? false }
+    lock.withLock {
+      guard let pid else { return false }
+      var status: Int32 = 0
+      let result = waitpid(pid, &status, WNOHANG)
+      if result == 0 { return true }
+      self.pid = nil
+      return false
+    }
   }
 
   func launch(
@@ -1049,39 +1057,59 @@ private final class MacAppLauncher: @unchecked Sendable {
     environment: [String: String],
     log: URL
   ) throws {
-    if !FileManager.default.fileExists(atPath: log.path) {
-      FileManager.default.createFile(atPath: log.path, contents: nil)
-    }
-    let output = try FileHandle(forWritingTo: log)
-    output.seekToEndOfFile()
+    var fileActions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&fileActions)
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    posix_spawn_file_actions_addopen(
+      &fileActions, STDOUT_FILENO, log.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    posix_spawn_file_actions_adddup2(&fileActions, STDOUT_FILENO, STDERR_FILENO)
 
-    let process = Process()
-    process.executableURL = executable
-    process.arguments = arguments
-    process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
-    process.standardInput = FileHandle.nullDevice
-    process.standardOutput = output
-    process.standardError = output
-    try process.run()
-    try? output.close()
-    lock.withLock { self.process = process }
+    var attributes: posix_spawnattr_t?
+    posix_spawnattr_init(&attributes)
+    defer { posix_spawnattr_destroy(&attributes) }
+    var defaultSignals = sigset_t()
+    sigfillset(&defaultSignals)
+    var noSignals = sigset_t()
+    sigemptyset(&noSignals)
+    posix_spawnattr_setsigdefault(&attributes, &defaultSignals)
+    posix_spawnattr_setsigmask(&attributes, &noSignals)
+    posix_spawnattr_setflags(
+      &attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK))
+
+    let mergedEnvironment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+    let argv = ([executable.path] + arguments).map { strdup($0) } + [nil]
+    let envp = mergedEnvironment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+    defer {
+      argv.forEach { free($0) }
+      envp.forEach { free($0) }
+    }
+
+    var child: pid_t = 0
+    let result = posix_spawn(&child, executable.path, &fileActions, &attributes, argv, envp)
+    guard result == 0 else {
+      throw HotReloadError(
+        "Couldn't launch \(executable.path): \(String(cString: strerror(result)))")
+    }
+    lock.withLock { pid = child }
   }
 
   /// Sends SIGTERM, waits up to three seconds, then SIGKILL.
   func terminate() {
-    guard let process = lock.withLock({ () -> Process? in
-      defer { self.process = nil }
-      return self.process
-    }), process.isRunning else { return }
-    let pid = process.processIdentifier
-    process.terminate()
+    guard let pid = lock.withLock({ () -> pid_t? in
+      defer { self.pid = nil }
+      return self.pid
+    }) else { return }
+    var status: Int32 = 0
+    guard waitpid(pid, &status, WNOHANG) == 0 else { return }
+    kill(pid, SIGTERM)
     let deadline = Date().addingTimeInterval(3)
-    while process.isRunning, Date() < deadline {
+    while Date() < deadline {
+      if waitpid(pid, &status, WNOHANG) != 0 { return }
       Thread.sleep(forTimeInterval: 0.05)
     }
-    if process.isRunning {
-      kill(pid, SIGKILL)
-    }
+    kill(pid, SIGKILL)
+    waitpid(pid, &status, 0)
   }
 }
 
