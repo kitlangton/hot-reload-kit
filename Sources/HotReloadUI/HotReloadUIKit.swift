@@ -220,130 +220,24 @@ import HotReloadRuntime
       #endif
     }
   }
-#elseif canImport(AppKit)
-  import AppKit
 
-  @MainActor
-  public final class HotReloadViewControllerHost<Hosted: NSViewController>: NSViewController {
-    public private(set) var hostedController: Hosted
-    #if DEBUG
-      private let buildController: @MainActor () -> Hosted
-      private var reloadSubscription: HotReloadSubscription?
-    #endif
-
-    public init(_ build: @autoclosure @escaping @MainActor () -> Hosted) {
-      let initial = build()
-      self.hostedController = initial
-      #if DEBUG
-        self.buildController = build
-      #endif
-      super.init(nibName: nil, bundle: nil)
-      self.title = initial.title
-      #if DEBUG
-        reloadSubscription = HotReloadRuntime.onReload { [weak self] _ in
-          self?.rebuildHostedController()
+  extension UITableView {
+    /// Reloads the visible rows after each hot reload, so cells configured by a
+    /// replaced method (or hosting a replaced SwiftUI body) pick up the change
+    /// and self-sizing rows recompute their heights.
+    @MainActor
+    @discardableResult
+    public func hotReloadReloadsVisibleRows() -> HotReloadSubscription {
+      #if DEBUG && targetEnvironment(simulator)
+        return HotReloadRuntime.onReload { [weak self] _ in
+          guard let self, let visible = indexPathsForVisibleRows, !visible.isEmpty else { return }
+          UIView.performWithoutAnimation {
+            reloadRows(at: visible, with: .none)
+          }
         }
+      #else
+        return HotReloadSubscription()
       #endif
     }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-      fatalError("init(coder:) has not been implemented")
-    }
-
-    deinit {
-      #if DEBUG
-        reloadSubscription?.cancel()
-      #endif
-    }
-
-    public override func loadView() {
-      view = NSView()
-      embed(hostedController)
-    }
-
-    private func embed(_ controller: Hosted) {
-      addChild(controller)
-      controller.view.frame = view.bounds
-      controller.view.autoresizingMask = [.width, .height]
-      view.addSubview(controller.view)
-      title = controller.title
-      preferredContentSize = controller.preferredContentSize
-    }
-
-    #if DEBUG
-      private func rebuildHostedController() {
-        let old = hostedController
-        if old.parent === self {
-          old.view.removeFromSuperview()
-          old.removeFromParent()
-        }
-        let fresh = buildController()
-        hostedController = fresh
-        if isViewLoaded {
-          embed(fresh)
-        } else {
-          title = fresh.title
-          preferredContentSize = fresh.preferredContentSize
-        }
-      }
-    #endif
-  }
-
-  @MainActor
-  public final class HotReloadViewHost<Hosted: NSView>: NSView {
-    public private(set) var hostedView: Hosted
-    #if DEBUG
-      private let buildView: @MainActor () -> Hosted
-      private var reloadSubscription: HotReloadSubscription?
-    #endif
-
-    public init(_ build: @autoclosure @escaping @MainActor () -> Hosted) {
-      let initial = build()
-      self.hostedView = initial
-      #if DEBUG
-        self.buildView = build
-      #endif
-      super.init(frame: initial.frame)
-      embed(initial)
-      #if DEBUG
-        reloadSubscription = HotReloadRuntime.onReload { [weak self] _ in
-          self?.rebuildHostedView()
-        }
-      #endif
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-      fatalError("init(coder:) has not been implemented")
-    }
-
-    deinit {
-      #if DEBUG
-        reloadSubscription?.cancel()
-      #endif
-    }
-
-    public override var intrinsicContentSize: NSSize {
-      hostedView.intrinsicContentSize
-    }
-
-    private func embed(_ child: NSView) {
-      child.frame = bounds
-      child.autoresizingMask = [.width, .height]
-      addSubview(child)
-    }
-
-    #if DEBUG
-      private func rebuildHostedView() {
-        hostedView.removeFromSuperview()
-        let fresh = buildView()
-        hostedView = fresh
-        embed(fresh)
-        invalidateIntrinsicContentSize()
-        needsLayout = true
-        layoutSubtreeIfNeeded()
-      }
-    #endif
   }
 #endif

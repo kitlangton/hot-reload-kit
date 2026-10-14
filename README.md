@@ -1,10 +1,11 @@
 # HotReloadKit
 
-HotReloadKit hot-reloads safe Swift `body` and class-method edits in a running iOS Simulator. It uses the Swift runtime's native `@_dynamicReplacement` mechanism—the same underlying facility used by Xcode Previews—rather than symbol interposition or runtime metadata mutation.
+HotReloadKit hot-reloads safe Swift `body` and class-method edits in a running iOS Simulator app or native macOS app. It uses the Swift runtime's native `@_dynamicReplacement` mechanism—the same underlying facility used by Xcode Previews—rather than symbol interposition or runtime metadata mutation.
 
 - **SwiftUI:** Edit `View.body` in single-view or multi-view files while keeping `@State`, navigation state, and models alive.
 - **Composable Architecture:** Edit `Reducer.body` (`Reduce { ... }`) while keeping the running `Store` alive.
 - **UIKit & mixed apps:** Edit class method bodies (`UIViewController`, `UIView`, cells, layout helpers), refresh live controllers in place via `HotReloadRefreshing` or `HotReloadRuntime.onReload`, rebuild stateless views/controllers with `HotReloadViewControllerHost` / `HotReloadViewHost`, and resize `UIHostingConfiguration` collection view rows in place.
+- **AppKit & native Mac apps:** `hotreload --platform macos` builds and launches the Mac app directly. The same API works on AppKit: `HotReloadRefreshing` on `NSViewController`/`NSView`/`NSWindowController`, `HotReloadViewControllerHost` / `HotReloadViewHost` for AppKit controllers and views (including `NSHostingController`), `NSTableView.hotReloadReloadsVisibleRows()`, and `NSCollectionView.hotReloadReconfiguresVisibleItems()`. Every reload also marks the windows' views as needing layout and display, so replaced `layout()`, `draw(_:)`, and `updateLayer()` show without wiring.
 - **Whole-project & remote watching:** Watch a single file (`--source`) or entire source trees (`--watch`), with automatic batching for multi-file `rsync` saves.
 - **Deterministic fallback:** Compile errors leave the running app untouched. Structural edits (stored properties, new types, method signature changes) automatically fall back to `xcodebuild`, install, and relaunch. Release and physical-device builds are completely inert.
 
@@ -18,7 +19,7 @@ HotReloadKit builds on ideas pioneered by:
 
 ## How it works
 
-1. **Baseline build:** `hotreload` builds and launches your app in the iOS Simulator with `-enable-implicit-dynamic`, `-enable-private-imports`, and `-export_dynamic`, passing a per-session manifest and receipt path via `simctl launch` environment variables.
+1. **Baseline build:** `hotreload` builds and launches your app in the iOS Simulator (or, with `--platform macos`, directly on the Mac) with `-enable-implicit-dynamic`, `-enable-private-imports`, and `-export_dynamic`, passing a per-session manifest and receipt path as environment variables (through `simctl launch` on iOS, to the launched process on macOS).
 2. **AST diffing (`HotReloadCore`):** On every save (or settled `rsync` batch), `ReplacementPlanner` parses the baseline and edited source for each changed file with `SwiftSyntax`. It verifies that edits are confined to `struct` computed `body` getters (any number of views/reducers per file) or `class` method bodies with unchanged signatures.
 3. **Thunk compilation:** Safe edits emit a replacement source file per changed file containing only the modified declarations:
    ```swift
@@ -41,7 +42,7 @@ See [`docs/architecture.md`](docs/architecture.md) for more detail.
 
 - macOS 15+ on Apple silicon
 - Xcode 26.6+ (Swift 6.3) or Xcode 27.0+ (Swift 6.4)
-- iOS 18.0+ Simulator deployment target
+- iOS 18.0+ Simulator or macOS 15.0+ deployment target
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.46+ (optional; required only for `--xcodegen` and the included `Example` project)
 
 ## Installation
@@ -174,7 +175,13 @@ NotificationCenter.default.addObserver(
 ) { _ in }
 ```
 
-#### 4. SwiftUI inside UIKit (`UIHostingConfiguration` cells)
+#### 4. Lists (`UITableView`)
+
+```swift
+tableView.hotReloadReloadsVisibleRows()
+```
+
+#### 5. SwiftUI inside UIKit (`UIHostingConfiguration` cells)
 
 When hosting `@HotReloadable` SwiftUI views inside `UICollectionView` cells via `UIHostingConfiguration`, the owning list should reconfigure its visible items and invalidate layout on reload so self-sizing cell heights update immediately:
 
@@ -184,6 +191,57 @@ collectionView.hotReloadReconfiguresVisibleItems(using: dataSource)
 ```
 
 Or in a custom list controller with its own scroll-anchor compensation, call your reconfigure/reload path inside `HotReloadRuntime.onReload { [weak self] _ in ... }`.
+
+### SwiftUI subtrees without annotations (`rebuildsOnHotReload()`)
+
+`@HotReloadable` redraws the annotated view in place and keeps its state. To pick up edits anywhere beneath a root without annotating every view, recreate the subtree on each reload:
+
+```swift
+WindowGroup {
+  RootView()
+    .rebuildsOnHotReload()
+}
+```
+
+The subtree gets a new identity, so its `@State`, focus, and scroll positions reset; models and stores held outside it survive. In Release builds it returns the view unchanged.
+
+### AppKit & native Mac apps
+
+Build and run the Mac app with `--platform macos` (see [Usage](#usage)). The AppKit API mirrors UIKit's:
+
+```swift
+import AppKit
+import HotReloadUI
+
+final class SessionsViewController: NSViewController, HotReloadRefreshing {
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    applyStyling()
+  }
+
+  func hotReloaded() {
+    applyStyling()
+  }
+
+  private func applyStyling() {
+    view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+  }
+}
+
+// Recreate a controller (or an NSHostingController) or view on each reload:
+let hosted = HotReloadViewControllerHost(NSHostingController(rootView: SettingsView()))
+let banner = HotReloadViewHost(BannerView())
+
+// Re-request visible cell views (and their heights) after a replaced configure method:
+tableView.hotReloadReloadsVisibleRows()
+collectionView.hotReloadReconfiguresVisibleItems()            // or (using: diffableDataSource)
+```
+
+- `HotReloadRefreshing.hotReloaded()` runs on conforming window controllers, windows, content view controllers (with their children and presented controllers), and views in every window, plus anything registered with `observeHotReload()`.
+- After each reload every view in the app's windows is marked as needing layout and display, and `NSHostingView`s recompute their intrinsic size, so replaced `layout()`, `draw(_:)`, and `updateLayer()` take effect immediately. Set `HotReloadRuntime.redrawsWindowsOnReload = false` to opt out.
+- SwiftUI content in `NSHostingView` / `NSHostingController` refreshes the same way as on iOS: `@HotReloadable` views redraw in place, and `rebuildsOnHotReload()` recreates a subtree.
+- The runtime starts on its own the first time `@HotReloadable`, `onReload`, or `observeHotReload()` is used; calling `HotReloadRuntime.start()` at launch is still fine.
+- The app must not use the hardened runtime with library validation in Debug (the replacement bundles are ad-hoc signed), and must keep `ENABLE_DEBUG_DYLIB = NO`.
 
 ### Build settings (Plain Xcode & XcodeGen)
 
@@ -223,6 +281,19 @@ targets:
 ```
 
 ## Usage
+
+### Run a native Mac app
+
+```bash
+hotreload \
+  --platform macos \
+  --project MyMacApp.xcodeproj \
+  --scheme MyMacApp \
+  --watch MyMacApp \
+  --use-project-build-settings
+```
+
+`hotreload` builds for `platform=macOS`, compiles replacement thunks against the macOS SDK, and launches the built app's executable directly (not through LaunchServices, so an installed copy with the same bundle identifier is never activated instead) with the manifest and receipt paths in its environment. The app's output goes to `<derived-data>/hotreload-app.log`. Structural edits rebuild and relaunch it; it quits with the session. If you quit the app yourself, the next save rebuilds and relaunches it.
 
 ### Watch an entire directory or project
 
@@ -264,12 +335,16 @@ When building and running the Simulator on a remote Mac devbox while editing loc
 | Option | Description |
 | --- | --- |
 | `--project <path>` | Path to the `.xcodeproj` (required). |
+| `--platform <ios\|macos>` | `ios` (iOS Simulator, default) or `macos` (native Mac app, launched directly). |
 | `--scheme <name>` | Xcode scheme and application target to build (required). |
 | `--watch <path>` | Directory or Swift file to watch (repeatable). Defaults to the project directory when `--source` is omitted. |
 | `--source <path>` | Single Swift source file to watch. |
 | `--simulator <udid>` | Simulator UDID. Defaults to a currently booted iOS Simulator. |
 | `--derived-data <path>` | DerivedData directory. Defaults to `<user-temp>/HotReloadKitDerivedData`. |
 | `--xcodegen` | Run `xcodegen generate` before the initial build and any structural rebuild. |
+| `--xcodegen-spec <path>` | Spec for `--xcodegen` when it isn't `project.yml` beside the project; the project is generated into the `--project` directory (useful for an opt-in overlay project kept out of the committed one). |
+| `--xcodebuild <path>` | Command used for baseline builds instead of `xcodebuild` (for example a wrapper that queues builds). |
+| `--launch-argument <arg>` | Argument passed to the launched app (repeatable). |
 | `--use-project-build-settings` | Rely on the app target's own Debug build settings instead of passing command-line overrides to `xcodebuild`. |
 
 ### Running the included example
@@ -279,6 +354,14 @@ When building and running the Simulator on a remote Mac devbox while editing loc
 ```
 
 The smoke test generates `Example/HotReloadExample.xcodeproj`, watches `Example/App`, hot-reloads a SwiftUI view (`ContentView.swift`), a TCA reducer (`CounterFeature.swift`), and a UIKit view controller (`UIKitPreviewViewController.swift`), then verifies an automatic structural rebuild.
+
+The macOS example (`Example/Mac`) has its own smoke test:
+
+```bash
+./scripts/test-example-macos.sh
+```
+
+It launches the Mac app, hot-reloads a SwiftUI body (`ContentView.swift`) and an `NSView` method (`BadgeView.swift`), reads back what the running app drew, and verifies an automatic structural rebuild and relaunch.
 
 ## What reloads vs. what rebuilds
 
@@ -316,7 +399,7 @@ The smoke test generates `Example/HotReloadExample.xcodeproj`, watches `Example/
 ## Limitations
 
 - **Top-level declarations only:** `struct` `body` properties and `class` methods must belong to top-level declarations (not types nested inside another `struct`, `enum`, or `class`). Editing a nested type falls back to a full rebuild.
-- **iOS Simulator only:** Physical iOS devices do not share the host filesystem or permit arbitrary unsigned `dlopen` bundles; the runtime is compiled out on device targets.
+- **iOS Simulator and Mac only:** Physical iOS devices do not share the host filesystem or permit arbitrary unsigned `dlopen` bundles; the runtime is compiled out on device targets. On macOS the runtime is Debug-only, and needs a Debug build without the hardened runtime's library validation.
 - **Resident replacement images:** The Swift runtime does not support unloading images (`dlclose`) that register Swift metadata or dynamic replacements. `hotreload` automatically performs a clean rebuild every 50 generations to reclaim loaded bundles.
 - **Underscored Swift features:** Dynamic replacement relies on `-Xfrontend -enable-implicit-dynamic`, `-Xfrontend -enable-private-imports`, `@_private(sourceFile:)`, and `@_dynamicReplacement(for:)`.
 
@@ -324,7 +407,8 @@ The smoke test generates `Example/HotReloadExample.xcodeproj`, watches `Example/
 
 - **CLI prints `generation N visible`, but the UI does not update:**
   - **SwiftUI:** Ensure the view (or an ancestor view) is annotated with `@HotReloadable` and `HotReloadRuntime.start()` is called once at launch.
-  - **UIKit:** Ensure your controller/view conforms to `HotReloadRefreshing`, is wrapped in `HotReloadViewControllerHost` / `HotReloadViewHost`, or subscribes to `HotReloadRuntime.onReload` to re-run the updated method.
+  - **UIKit / AppKit:** Ensure your controller/view conforms to `HotReloadRefreshing`, is wrapped in `HotReloadViewControllerHost` / `HotReloadViewHost`, or subscribes to `HotReloadRuntime.onReload` to re-run the updated method.
+  - **`NSTableView` / `NSCollectionView` cells:** Call `tableView.hotReloadReloadsVisibleRows()` or `collectionView.hotReloadReconfiguresVisibleItems()` once when you set the list up.
   - **`UIHostingConfiguration` cells:** Ensure the owning `UICollectionView` reconfigures/reloads visible items and invalidates layout on reload (e.g. via `collectionView.hotReloadReconfiguresVisibleItems(using: dataSource)`).
 - **`Timed out waiting for generation N to load`:**
   - Verify that `HotReloadRuntime.start()` runs at launch and the app is not paused in LLDB or terminated.

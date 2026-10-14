@@ -1,0 +1,32 @@
+name: HotReloadMacExample
+options:
+  bundleIdPrefix: dev.kitlangton
+  deploymentTarget:
+    macOS: "15.0"
+packages:
+  HotReloadKit:
+    path: ../..
+targets:
+  HotReloadMacExample:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - package: HotReloadKit
+        product: HotReloadUI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.kitlangton.HotReloadMacExample
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_VERSION: 6.0
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: false
+      configs:
+        Debug:
+          ENABLE_DEBUG_DYLIB: false
+          SWIFT_ENABLE_OPAQUE_TYPE_ERASURE: true
+          OTHER_SWIFT_FLAGS: "$(inherited) -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-private-imports"
+          OTHER_LDFLAGS: "$(inherited) -Xlinker -export_dynamic"
+    scheme: {}

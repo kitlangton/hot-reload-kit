@@ -4,6 +4,8 @@ import HotReloadProtocol
 
 #if canImport(UIKit)
   import UIKit
+#elseif canImport(AppKit)
+  import AppKit
 #endif
 
 #if DEBUG && (targetEnvironment(simulator) || os(macOS))
@@ -80,7 +82,19 @@ public final class HotReloadObserver: ObservableObject {
     private static var hasStarted = false
     private static var manifestTask: Task<Void, Never>?
 
+    #if canImport(AppKit) && !canImport(UIKit)
+      /// Whether each reload marks every view in the app's windows as needing
+      /// layout and display, so replaced `layout()`, `draw(_:)`, and
+      /// `updateLayer()` implementations take effect without app wiring.
+      /// Hosting views also recompute their intrinsic size. On by default.
+      public static var redrawsWindowsOnReload = true
+    #endif
+
+    /// An observer invalidated by every reload, whatever it replaced.
+    public static let everyReload = HotReloadObserver()
+
     public static func observer(for declaration: String) -> HotReloadObserver {
+      start()
       if let observer = declarationObservers[declaration] { return observer }
       let observer = HotReloadObserver()
       declarationObservers[declaration] = observer
@@ -91,6 +105,7 @@ public final class HotReloadObserver: ObservableObject {
     public static func onReload(
       _ handler: @escaping @MainActor (Int) -> Void
     ) -> HotReloadSubscription {
+      start()
       let id = UUID()
       reloadHandlers[id] = handler
       return HotReloadSubscription {
@@ -119,10 +134,14 @@ public final class HotReloadObserver: ObservableObject {
     }
 
     public static func register(_ object: some HotReloadRefreshing) {
+      start()
       refreshingObjects.removeAll { $0.value == nil || $0.value === object }
       refreshingObjects.append(WeakRefreshingBox(object))
     }
 
+    /// Starts watching the session manifest the `hotreload` CLI passes to the
+    /// app. Idempotent; `observer(for:)`, `onReload`, and `register` also start
+    /// it, so apps that use any of them don't need to call it.
     public static func start() {
       guard !hasStarted else { return }
       hasStarted = true
@@ -201,6 +220,7 @@ public final class HotReloadObserver: ObservableObject {
           observer.invalidate()
         }
       }
+      everyReload.invalidate()
 
       var notifiedObjects: Set<ObjectIdentifier> = []
       refreshingObjects = refreshingObjects.filter { $0.value != nil }
@@ -211,7 +231,7 @@ public final class HotReloadObserver: ObservableObject {
         }
       }
 
-      #if canImport(UIKit)
+      #if canImport(UIKit) || canImport(AppKit)
         notifyHierarchyRefreshingObjects(excluding: &notifiedObjects)
       #endif
 
@@ -280,6 +300,78 @@ public final class HotReloadObserver: ObservableObject {
           notifyViewHierarchy(subview, excluding: &notified)
         }
       }
+    #elseif canImport(AppKit)
+      private static func notifyHierarchyRefreshingObjects(
+        excluding notified: inout Set<ObjectIdentifier>
+      ) {
+        for window in NSApplication.shared.windows {
+          if let controller = window.windowController {
+            notify(controller, excluding: &notified)
+          }
+          notify(window, excluding: &notified)
+          if let root = window.contentViewController {
+            notifyViewControllerHierarchy(root, excluding: &notified)
+          }
+          // The content view's superview is the window's frame view, which
+          // also holds titlebar and toolbar accessory views.
+          if let root = window.contentView?.superview ?? window.contentView {
+            notifyViewHierarchy(root, excluding: &notified)
+          }
+        }
+      }
+
+      private static func notify(
+        _ object: AnyObject,
+        excluding notified: inout Set<ObjectIdentifier>
+      ) {
+        let id = ObjectIdentifier(object)
+        guard !notified.contains(id), let refreshing = object as? any HotReloadRefreshing else {
+          return
+        }
+        notified.insert(id)
+        refreshing.hotReloaded()
+      }
+
+      private static func notifyViewControllerHierarchy(
+        _ controller: NSViewController,
+        excluding notified: inout Set<ObjectIdentifier>
+      ) {
+        notify(controller, excluding: &notified)
+        for child in controller.children {
+          notifyViewControllerHierarchy(child, excluding: &notified)
+        }
+        for presented in controller.presentedViewControllers ?? [] {
+          notifyViewControllerHierarchy(presented, excluding: &notified)
+        }
+      }
+
+      private static func notifyViewHierarchy(
+        _ view: NSView,
+        excluding notified: inout Set<ObjectIdentifier>
+      ) {
+        notify(view, excluding: &notified)
+        if redrawsWindowsOnReload {
+          view.needsLayout = true
+          view.needsDisplay = true
+          if isHostingView(view) {
+            view.invalidateIntrinsicContentSize()
+          }
+        }
+        for subview in view.subviews {
+          notifyViewHierarchy(subview, excluding: &notified)
+        }
+      }
+
+      /// `NSHostingView<Content>` is generic, so it's matched by name: its
+      /// SwiftUI content may have changed size after a body replacement.
+      private static func isHostingView(_ view: NSView) -> Bool {
+        var type: AnyClass? = Swift.type(of: view)
+        while let current = type {
+          if NSStringFromClass(current).contains("NSHostingView") { return true }
+          type = class_getSuperclass(current)
+        }
+        return false
+      }
     #endif
 
     nonisolated private static func watchManifest(at url: URL, receiptURL: URL) async {
@@ -330,6 +422,12 @@ public final class HotReloadObserver: ObservableObject {
       "HotReloadRuntimeDidReload")
 
     private static let disabledObserver = HotReloadObserver()
+
+    public static var everyReload: HotReloadObserver { disabledObserver }
+
+    #if canImport(AppKit) && !canImport(UIKit)
+      public static var redrawsWindowsOnReload = true
+    #endif
 
     public static func observer(for declaration: String) -> HotReloadObserver {
       disabledObserver

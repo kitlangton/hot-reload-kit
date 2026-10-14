@@ -6,3 +6,4 @@ Example/HotReloadExample.xcodeproj/
 Example/.hotreload/
 *.xcuserstate
 xcuserdata/
+Example/Mac/HotReloadMacExample.xcodeproj/

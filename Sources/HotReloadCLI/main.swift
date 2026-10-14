@@ -7,7 +7,8 @@ import HotReloadProtocol
 struct HotReloadCommand: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "hotreload",
-    abstract: "Hot-reload safe Swift body and class method edits in an iOS Simulator.",
+    abstract:
+      "Hot-reload safe Swift body and class method edits in an iOS Simulator or a native macOS app.",
     version: "0.1.0"
   )
 
@@ -16,6 +17,34 @@ struct HotReloadCommand: AsyncParsableCommand {
 
   @Option(help: "Scheme and application target to build.")
   var scheme: String
+
+  @Option(
+    help: ArgumentHelp(
+      "Platform to build and run: ios (iOS Simulator, default) or macos (native Mac app).",
+      valueName: "ios|macos"
+    ),
+    transform: { value in
+      guard let platform = TargetPlatform(argument: value) else {
+        throw ValidationError("Unknown platform '\(value)'. Use ios or macos.")
+      }
+      return platform
+    }
+  )
+  var platform: TargetPlatform = .iOSSimulator
+
+  @Option(
+    help: ArgumentHelp(
+      "Command used for xcodebuild builds (for example a wrapper that queues builds). Receives the usual xcodebuild arguments.",
+      valueName: "path"
+    )
+  )
+  var xcodebuild = "xcodebuild"
+
+  @Option(
+    name: .customLong("launch-argument"),
+    help: "Argument passed to the launched app (repeatable)."
+  )
+  var launchArguments: [String] = []
 
   @Option(help: "Single Swift source file to watch.")
   var source: String?
@@ -35,6 +64,14 @@ struct HotReloadCommand: AsyncParsableCommand {
 
   @Flag(help: "Run xcodegen before the initial build and structural rebuilds.")
   var xcodegen = false
+
+  @Option(
+    help: ArgumentHelp(
+      "XcodeGen spec for --xcodegen when it isn't project.yml beside the project (the project is generated into the --project directory).",
+      valueName: "path"
+    )
+  )
+  var xcodegenSpec: String?
 
   @Flag(help: "Use hot-reload compiler and linker settings already defined by the application target.")
   var useProjectBuildSettings = false
@@ -82,19 +119,27 @@ struct HotReloadCommand: AsyncParsableCommand {
       attributes: [.posixPermissions: 0o700]
     )
     defer { try? FileManager.default.removeItem(at: sessionURL) }
-    let signalSources = Self.installSignalCleanup(removing: sessionURL)
+    let launcher = MacAppLauncher()
+    let signalSources = Self.installSignalCleanup(removing: sessionURL, launcher: launcher)
     defer { signalSources.forEach { $0.cancel() } }
+    defer { launcher.terminate() }
 
-    let deviceID = try simulator ?? Self.bootedSimulatorID()
+    let deviceID: String? =
+      platform.usesSimulator ? try simulator ?? Self.bootedSimulatorID() : nil
     var watcher = SourceTreeWatcher(roots: watchTargets, excludedRoot: derivedDataURL)
     var session = Session(
       project: projectURL,
       scheme: scheme,
+      platform: platform,
       derivedData: derivedDataURL,
       deviceID: deviceID,
       sessionDirectory: sessionURL,
       runsXcodeGen: xcodegen,
-      usesProjectBuildSettings: useProjectBuildSettings
+      xcodeGenSpec: xcodegenSpec.map { resolve($0, relativeTo: root) },
+      usesProjectBuildSettings: useProjectBuildSettings,
+      xcodebuild: xcodebuild,
+      launchArguments: launchArguments,
+      launcher: launcher
     )
     let initialFiles = try watcher.snapshotAllFiles()
     try session.bootstrap(initialSources: initialFiles)
@@ -118,11 +163,15 @@ struct HotReloadCommand: AsyncParsableCommand {
     }
   }
 
-  private static func installSignalCleanup(removing sessionURL: URL) -> [any DispatchSourceSignal] {
+  private static func installSignalCleanup(
+    removing sessionURL: URL,
+    launcher: MacAppLauncher
+  ) -> [any DispatchSourceSignal] {
     [SIGINT, SIGTERM].map { sig in
       signal(sig, SIG_IGN)
       let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
       source.setEventHandler {
+        launcher.terminate()
         try? FileManager.default.removeItem(at: sessionURL)
         _exit(128 + sig)
       }
@@ -348,15 +397,21 @@ private struct SourceTreeWatcher {
 private struct Session {
   let project: URL
   let scheme: String
+  let platform: TargetPlatform
   let derivedData: URL
-  let deviceID: String
+  let deviceID: String?
   let sessionDirectory: URL
   let runsXcodeGen: Bool
+  let xcodeGenSpec: URL?
   let usesProjectBuildSettings: Bool
+  let xcodebuild: String
+  let launchArguments: [String]
+  let launcher: MacAppLauncher
 
   private var manifest: URL { sessionDirectory.appending(path: "manifest.json") }
   private var receipt: URL { sessionDirectory.appending(path: "receipt.json") }
   private var projectDirectory: URL { project.deletingLastPathComponent() }
+  private var appLog: URL { derivedData.appending(path: "hotreload-app.log") }
 
   private var baselines: [URL: String] = [:]
   private var settings: BuildSettings?
@@ -365,19 +420,29 @@ private struct Session {
   init(
     project: URL,
     scheme: String,
+    platform: TargetPlatform,
     derivedData: URL,
-    deviceID: String,
+    deviceID: String?,
     sessionDirectory: URL,
     runsXcodeGen: Bool,
-    usesProjectBuildSettings: Bool
+    xcodeGenSpec: URL?,
+    usesProjectBuildSettings: Bool,
+    xcodebuild: String,
+    launchArguments: [String],
+    launcher: MacAppLauncher
   ) {
     self.project = project
     self.scheme = scheme
+    self.platform = platform
     self.derivedData = derivedData
     self.deviceID = deviceID
     self.sessionDirectory = sessionDirectory
     self.runsXcodeGen = runsXcodeGen
+    self.xcodeGenSpec = xcodeGenSpec
     self.usesProjectBuildSettings = usesProjectBuildSettings
+    self.xcodebuild = xcodebuild
+    self.launchArguments = launchArguments
+    self.launcher = launcher
   }
 
   mutating func bootstrap(initialSources: [URL: String]) throws {
@@ -412,6 +477,16 @@ private struct Session {
     }
 
     guard !batch.changedFiles.isEmpty else { return false }
+
+    if !platform.usesSimulator, !launcher.isRunning {
+      print("[hotreload] app is no longer running; rebuilding and relaunching")
+      try buildAndLaunch()
+      for (url, content) in batch.changedFiles {
+        baselines[url] = content
+      }
+      print("[hotreload] rebuilt and relaunched")
+      return true
+    }
 
     if generation == 0,
       batch.changedFiles.allSatisfy({ baselines[$0.url] == $0.content })
@@ -494,16 +569,21 @@ private struct Session {
 
   private mutating func buildAndLaunch() throws {
     if runsXcodeGen {
-      try ProcessRunner.run(
-        "xcodegen", ["generate"], directory: projectDirectory)
+      var arguments = ["generate"]
+      if let xcodeGenSpec {
+        arguments += ["--spec", xcodeGenSpec.path, "--project", projectDirectory.path, "--quiet"]
+      }
+      try ProcessRunner.run("xcodegen", arguments, directory: projectDirectory)
     }
 
-    print("[hotreload] preparing simulator")
-    try ProcessRunner.run("xcrun", ["simctl", "boot", deviceID], quiet: true, allowFailure: true)
-    try ProcessRunner.run("xcrun", ["simctl", "bootstatus", deviceID, "-b"], quiet: true)
+    if let deviceID, platform.usesSimulator {
+      print("[hotreload] preparing simulator")
+      try ProcessRunner.run("xcrun", ["simctl", "boot", deviceID], quiet: true, allowFailure: true)
+      try ProcessRunner.run("xcrun", ["simctl", "bootstatus", deviceID, "-b"], quiet: true)
+    }
     print("[hotreload] building baseline")
     try ProcessRunner.run(
-      "xcodebuild", buildArguments(command: "build"), directory: projectDirectory
+      xcodebuild, buildArguments(command: "build"), directory: projectDirectory
     )
 
     print("[hotreload] reading build settings")
@@ -528,30 +608,50 @@ private struct Session {
       throw HotReloadError("xcodebuild returned no application build settings")
     }
     let sdk = try ProcessRunner.captureTrimmed(
-      "xcrun", ["--sdk", "iphonesimulator", "--show-sdk-path"])
+      "xcrun", ["--sdk", platform.sdkName, "--show-sdk-path"])
     let swiftc = try ProcessRunner.captureTrimmed(
       "xcrun", ["--toolchain", "default", "--find", "swiftc"])
-    let buildSettings = try BuildSettings(values: values, sdk: sdk, swiftc: swiftc)
+    let buildSettings = try BuildSettings(
+      values: values, platform: platform, sdk: sdk, swiftc: swiftc)
     settings = buildSettings
 
-    print("[hotreload] installing baseline")
-    try ProcessRunner.run(
-      "xcrun", ["simctl", "install", deviceID, buildSettings.app.path], quiet: true)
+    switch platform {
+    case .iOSSimulator:
+      guard let deviceID else { throw HotReloadError("No simulator selected") }
+      print("[hotreload] installing baseline")
+      try ProcessRunner.run(
+        "xcrun", ["simctl", "install", deviceID, buildSettings.app.path], quiet: true)
 
-    try? FileManager.default.removeItem(at: manifest)
-    try? FileManager.default.removeItem(at: receipt)
+      try? FileManager.default.removeItem(at: manifest)
+      try? FileManager.default.removeItem(at: receipt)
 
-    try ProcessRunner.run(
-      "xcrun",
-      [
-        "simctl", "launch", "--terminate-running-process", deviceID, buildSettings.bundleIdentifier,
-      ],
-      environment: [
-        "SIMCTL_CHILD_HOTRELOAD_MANIFEST_PATH": manifest.path,
-        "SIMCTL_CHILD_HOTRELOAD_RECEIPT_PATH": receipt.path,
-      ],
-      quiet: true
-    )
+      try ProcessRunner.run(
+        "xcrun",
+        [
+          "simctl", "launch", "--terminate-running-process", deviceID,
+          buildSettings.bundleIdentifier,
+        ] + launchArguments,
+        environment: [
+          "SIMCTL_CHILD_HOTRELOAD_MANIFEST_PATH": manifest.path,
+          "SIMCTL_CHILD_HOTRELOAD_RECEIPT_PATH": receipt.path,
+        ],
+        quiet: true
+      )
+    case .macOS:
+      launcher.terminate()
+      try? FileManager.default.removeItem(at: manifest)
+      try? FileManager.default.removeItem(at: receipt)
+      try launcher.launch(
+        executable: buildSettings.executable,
+        arguments: launchArguments,
+        environment: [
+          "HOTRELOAD_MANIFEST_PATH": manifest.path,
+          "HOTRELOAD_RECEIPT_PATH": receipt.path,
+        ],
+        log: appLog
+      )
+      print("[hotreload] app output: \(appLog.path)")
+    }
     print("[hotreload] launched baseline")
     generation = 0
   }
@@ -563,7 +663,7 @@ private struct Session {
       "-project", project.path,
       "-scheme", scheme,
       "-derivedDataPath", derivedData.path,
-      "-destination", "platform=iOS Simulator,id=\(deviceID)",
+      "-destination", platform.destination(deviceID: deviceID, architecture: hostArchitecture),
     ]
     if usesProjectBuildSettings { return base }
     return base + [
@@ -610,12 +710,14 @@ private struct Session {
 
       var compilerArguments =
         [
-          "--sdk", "iphonesimulator", "swiftc",
+          "--sdk", platform.sdkName, "swiftc",
           "-emit-object", "-parse-as-library",
           "-module-name", moduleName,
           thunk.path,
           "-o", object.path,
-          "-target", "\(settings.architecture)-apple-ios\(settings.deploymentTarget)-simulator",
+          "-target",
+          platform.targetTriple(
+            architecture: settings.architecture, deploymentTarget: settings.deploymentTarget),
           "-swift-version", settings.swiftVersion,
           "-sdk", settings.sdk,
           "-I", settings.targetBuildDirectory.path,
@@ -637,11 +739,11 @@ private struct Session {
     try ProcessRunner.run(
       "xcrun",
       [
-        "--sdk", "iphonesimulator", "clang",
+        "--sdk", platform.sdkName, "clang",
         "-bundle",
         "-arch", settings.architecture,
         "-isysroot", settings.sdk,
-        "-mios-simulator-version-min=\(settings.deploymentTarget)",
+        platform.minimumVersionFlag(deploymentTarget: settings.deploymentTarget),
         "-bundle_loader", settings.executable.path,
         "-L", settings.swiftLibraries.path,
         "-rpath", "/usr/lib/swift",
@@ -698,7 +800,7 @@ private struct BuildSettings {
   let frameworkSearchFlags: [String]
   let compilerArguments: [String]
 
-  init(values: [String: String], sdk: String, swiftc: String) throws {
+  init(values: [String: String], platform: TargetPlatform, sdk: String, swiftc: String) throws {
     func required(_ key: String) throws -> String {
       guard let value = values[key], !value.isEmpty else {
         throw HotReloadError("Missing Xcode build setting \(key)")
@@ -708,7 +810,7 @@ private struct BuildSettings {
 
     moduleName = try required("PRODUCT_MODULE_NAME")
     bundleIdentifier = try required("PRODUCT_BUNDLE_IDENTIFIER")
-    deploymentTarget = try required("IPHONEOS_DEPLOYMENT_TARGET")
+    deploymentTarget = try required(platform.deploymentTargetSetting)
     architecture = values["NATIVE_ARCH_ACTUAL"] ?? "arm64"
     let configuredSwiftVersion = values["SWIFT_VERSION"] ?? "6"
     swiftVersion =
@@ -777,14 +879,16 @@ private struct BuildSettings {
     }
     compilerArguments = swiftArgs
 
-    app = targetBuildDirectory.appending(
-      path: try required("FULL_PRODUCT_NAME"), directoryHint: .isDirectory)
-    executable = app.appending(path: try required("EXECUTABLE_NAME"))
+    let fullProductName = try required("FULL_PRODUCT_NAME")
+    app = targetBuildDirectory.appending(path: fullProductName, directoryHint: .isDirectory)
+    executable = targetBuildDirectory.appending(
+      path: platform.executableRelativePath(
+        executablePath: values["EXECUTABLE_PATH"],
+        fullProductName: fullProductName,
+        executableName: try required("EXECUTABLE_NAME")
+      ))
     self.sdk = sdk
-    swiftLibraries = URL(fileURLWithPath: swiftc)
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-      .appending(path: "lib/swift/iphonesimulator")
+    swiftLibraries = platform.swiftLibraryDirectory(swiftc: swiftc)
   }
 
   private static func searchPaths(in value: String?, flag: String) -> [String] {
@@ -916,6 +1020,68 @@ private enum ProcessRunner {
         "\(executable) failed (\(process.terminationStatus))\n\(text)\(errorText)")
     }
     return text
+  }
+}
+
+#if arch(arm64)
+  private let hostArchitecture = "arm64"
+#else
+  private let hostArchitecture = "x86_64"
+#endif
+
+/// Owns the native macOS app process a `--platform macos` session launches.
+///
+/// The app is executed directly (not through LaunchServices), so the session
+/// always knows the exact process it published replacements to, a second copy
+/// with the same bundle identifier never activates instead, and the app quits
+/// with the session.
+private final class MacAppLauncher: @unchecked Sendable {
+  private let lock = NSLock()
+  private var process: Process?
+
+  var isRunning: Bool {
+    lock.withLock { process?.isRunning ?? false }
+  }
+
+  func launch(
+    executable: URL,
+    arguments: [String],
+    environment: [String: String],
+    log: URL
+  ) throws {
+    if !FileManager.default.fileExists(atPath: log.path) {
+      FileManager.default.createFile(atPath: log.path, contents: nil)
+    }
+    let output = try FileHandle(forWritingTo: log)
+    output.seekToEndOfFile()
+
+    let process = Process()
+    process.executableURL = executable
+    process.arguments = arguments
+    process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = output
+    process.standardError = output
+    try process.run()
+    try? output.close()
+    lock.withLock { self.process = process }
+  }
+
+  /// Sends SIGTERM, waits up to three seconds, then SIGKILL.
+  func terminate() {
+    guard let process = lock.withLock({ () -> Process? in
+      defer { self.process = nil }
+      return self.process
+    }), process.isRunning else { return }
+    let pid = process.processIdentifier
+    process.terminate()
+    let deadline = Date().addingTimeInterval(3)
+    while process.isRunning, Date() < deadline {
+      Thread.sleep(forTimeInterval: 0.05)
+    }
+    if process.isRunning {
+      kill(pid, SIGKILL)
+    }
   }
 }
 
