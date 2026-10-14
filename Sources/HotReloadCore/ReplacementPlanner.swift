@@ -170,6 +170,18 @@ package enum ReplacementPlanner {
           }
           """
         )
+      case .computedProperty(let property):
+        let suffix = changedIndices.count > 1 ? "\(index)_\(generation)" : "\(generation)"
+        extensionBlocks.append(
+          """
+          extension \(editUnit.declaration) {
+            @_dynamicReplacement(for: \(property.name))
+            \(property.replacementPrefix)var __hotReload_\(property.name)_\(suffix): \(editUnit.returnType) {
+          \(statements)
+            }
+          }
+          """
+        )
       }
 
       if !changedDeclarations.contains(editUnit.declaration) {
@@ -257,9 +269,16 @@ private struct ClassMethodInfo: Equatable {
   let fullOriginalHeader: String
 }
 
+private struct ComputedPropertyInfo: Equatable {
+  let name: String
+  let replacementPrefix: String
+  let fullOriginalHeader: String
+}
+
 private enum ReloadableUnitKind: Equatable {
   case structBody
   case classMethod(ClassMethodInfo)
+  case computedProperty(ComputedPropertyInfo)
 }
 
 private struct ReloadableUnit {
@@ -277,6 +296,8 @@ private struct ReloadableUnit {
       return "struct:\(declaration):body:\(returnType)"
     case .classMethod(let method):
       return "class:\(declaration):func:\(method.fullOriginalHeader)"
+    case .computedProperty(let property):
+      return "type:\(declaration):var:\(property.fullOriginalHeader):\(returnType)"
     }
   }
 }
@@ -401,35 +422,121 @@ private final class ReloadableUnitCollector: SyntaxVisitor {
   }
 
   override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
-    guard case .structDecl(let declaration, _) = stack.last,
-      node.bindings.count == 1,
+    let declaration: String
+    let isGenericType: Bool
+    let isStruct: Bool
+    switch stack.last {
+    case .structDecl(let name, let isGeneric):
+      (declaration, isGenericType, isStruct) = (name, isGeneric, true)
+    case .classDecl(let name, let isGeneric):
+      (declaration, isGenericType, isStruct) = (name, isGeneric, false)
+    default:
+      return .skipChildren
+    }
+    guard node.bindings.count == 1,
       let binding = node.bindings.first,
-      binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text == "body",
+      let name = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
       let returnType = binding.typeAnnotation?.type.trimmedDescription,
-      let accessorBlock = binding.accessorBlock,
-      case .getter(let statements) = accessorBlock.accessors
+      let accessorBlock = binding.accessorBlock
     else { return .skipChildren }
 
     let isNested = stack.count > 1
-    let unsafetyReason: String? = isNested ? "Nested declarations are not reloadable yet" : nil
+    let startOffset = accessorBlock.positionAfterSkippingLeadingTrivia.utf8Offset
+    let endOffset = accessorBlock.endPositionBeforeTrailingTrivia.utf8Offset
+
+    if isStruct, name == "body" {
+      guard case .getter(let statements) = accessorBlock.accessors else { return .skipChildren }
+      rawUnits.append(
+        ReloadableUnit(
+          declaration: declaration,
+          kind: .structBody,
+          returnType: returnType,
+          statements: statements.description,
+          unsafetyReason: isNested ? "Nested declarations are not reloadable yet" : nil,
+          startOffset: startOffset,
+          endOffset: endOffset
+        ))
+      return .skipChildren
+    }
+
+    // Other get-only computed properties (`var sidebar: some View { ... }`,
+    // `var title: String { get { ... } }`) on structs and classes.
+    let statements: CodeBlockItemListSyntax
+    switch accessorBlock.accessors {
+    case .getter(let getter):
+      statements = getter
+    case .accessors(let accessors):
+      guard accessors.count == 1, let getter = accessors.first,
+        getter.accessorSpecifier.tokenKind == .keyword(.get),
+        getter.effectSpecifiers == nil,
+        let body = getter.body
+      else { return .skipChildren }
+      statements = body.statements
+    }
+
+    var prefixParts: [String] = []
+    for element in node.attributes {
+      if let attr = element.as(AttributeSyntax.self) {
+        let attrName = attr.attributeName.trimmedDescription
+        if attrName == "MainActor" || attrName == "ViewBuilder" {
+          prefixParts.append(attr.trimmedDescription)
+        }
+      }
+    }
+    for modifier in node.modifiers {
+      switch modifier.name.text {
+      case "nonisolated": prefixParts.append("nonisolated")
+      case "static", "class": prefixParts.append("static")
+      default: break
+      }
+    }
+    let replacementPrefix = prefixParts.isEmpty ? "" : prefixParts.joined(separator: " ") + " "
+
+    var unsafetyReason: String?
+    if isNested {
+      unsafetyReason = "Nested declarations are not reloadable yet"
+    } else if isGenericType {
+      unsafetyReason = "Members of generic types require a rebuild"
+    } else if (returnType == "some" || returnType.hasPrefix("some "))
+      && returnType != "some View" && returnType != "some SwiftUI.View"
+    {
+      unsafetyReason = "Computed properties with opaque types other than some View require a rebuild"
+    } else if Self.hasUnsupportedMethodAttribute(node.attributes) {
+      unsafetyReason = "Computed properties with special runtime attributes require a rebuild"
+    }
 
     rawUnits.append(
       ReloadableUnit(
         declaration: declaration,
-        kind: .structBody,
+        kind: .computedProperty(
+          ComputedPropertyInfo(
+            name: name,
+            replacementPrefix: replacementPrefix,
+            fullOriginalHeader:
+              "\(node.attributes.trimmedDescription)|\(node.modifiers.trimmedDescription)|\(name)"
+          )),
         returnType: returnType,
         statements: statements.description,
         unsafetyReason: unsafetyReason,
-        startOffset: accessorBlock.positionAfterSkippingLeadingTrivia.utf8Offset,
-        endOffset: accessorBlock.endPositionBeforeTrailingTrivia.utf8Offset
+        startOffset: startOffset,
+        endOffset: endOffset
       ))
     return .skipChildren
   }
 
   override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
-    guard case .classDecl(let declaration, let isGenericClass) = stack.last,
-      let body = node.body
-    else { return .skipChildren }
+    let declaration: String
+    let isGenericClass: Bool
+    let isStruct: Bool
+    switch stack.last {
+    case .classDecl(let name, let isGeneric):
+      (declaration, isGenericClass, isStruct) = (name, isGeneric, false)
+    case .structDecl(let name, let isGeneric):
+      (declaration, isGenericClass, isStruct) = (name, isGeneric, true)
+    default:
+      return .skipChildren
+    }
+    guard let body = node.body else { return .skipChildren }
 
     let isNested = stack.count > 1
     let baseName = node.name.text
@@ -468,6 +575,8 @@ private final class ReloadableUnitCollector: SyntaxVisitor {
         prefixParts.append("nonisolated")
       } else if modText == "static" || modText == "class" {
         prefixParts.append("static")
+      } else if modText == "mutating" {
+        prefixParts.append("mutating")
       }
     }
     let replacementPrefix = prefixParts.isEmpty ? "" : prefixParts.joined(separator: " ") + " "
@@ -479,7 +588,7 @@ private final class ReloadableUnitCollector: SyntaxVisitor {
     if isNested {
       unsafetyReason = "Nested declarations are not reloadable yet"
     } else if isGenericClass {
-      unsafetyReason = "Generic classes require a rebuild"
+      unsafetyReason = isStruct ? "Members of generic types require a rebuild" : "Generic classes require a rebuild"
     } else if node.genericParameterClause != nil || node.genericWhereClause != nil {
       unsafetyReason = "Generic class methods require a rebuild"
     } else if (returnType == "some" || returnType.hasPrefix("some "))

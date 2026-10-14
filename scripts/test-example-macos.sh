@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Smoke test for --platform macos: builds Example/Mac, launches it on this Mac,
-# hot-reloads a SwiftUI body and an AppKit (NSView) method, checks the running
-# app drew both edits, then checks a structural edit rebuilds and relaunches.
+# hot-reloads a SwiftUI body, a computed helper property, and an AppKit (NSView)
+# method, checks the running app drew each edit, then checks a structural edit
+# rebuilds and relaunches.
 #
-# HOTRELOAD_XCODEBUILD names a wrapper for the baseline builds (default xcodebuild).
+# HOTRELOAD_XCODEBUILD names a wrapper for the baseline builds (default xcodebuild);
+# HOTRELOAD_BIN uses a prebuilt hotreload instead of building it.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -70,8 +72,11 @@ cd "$root/Example/Mac"
 "$xcodegen_bin" generate >/dev/null
 cd "$root"
 
-swift build --product hotreload
-hotreload_bin="$root/.build/debug/hotreload"
+hotreload_bin="${HOTRELOAD_BIN:-}"
+if [[ -z "$hotreload_bin" ]]; then
+  swift build --product hotreload
+  hotreload_bin="$root/.build/debug/hotreload"
+fi
 
 : >"$log_file"
 HOTRELOAD_EXAMPLE_PROBE="$probe_dir" "$hotreload_bin" \
@@ -88,14 +93,20 @@ daemon_pid=$!
 wait_for "baseline" log_has "[hotreload] watching"
 wait_for "baseline SwiftUI body drawn" probe_is swiftui "SwiftUI Body"
 wait_for "baseline AppKit view drawn" probe_is appkit "AppKit Method"
+wait_for "baseline helper drawn" probe_is helper "Helper Property"
 
 perl -0pi -e 's/"SwiftUI Body"/"Hot Reloaded SwiftUI"/' "$view_file"
 wait_for "generation 1" log_has "generation 1 visible"
 wait_for "SwiftUI body redrawn" probe_is swiftui "Hot Reloaded SwiftUI"
 echo "SwiftUI body reloaded in the running Mac app"
 
-perl -0pi -e 's/"AppKit Method"/"Hot Reloaded AppKit"/' "$badge_file"
+perl -0pi -e 's/"Helper Property"/"Hot Reloaded Helper"/' "$view_file"
 wait_for "generation 2" log_has "generation 2 visible"
+wait_for "helper property redrawn" probe_is helper "Hot Reloaded Helper"
+echo "SwiftUI helper property reloaded in the running Mac app"
+
+perl -0pi -e 's/"AppKit Method"/"Hot Reloaded AppKit"/' "$badge_file"
+wait_for "generation 3" log_has "generation 3 visible"
 wait_for "NSView method rerun" probe_is appkit "Hot Reloaded AppKit"
 echo "NSView method reloaded in the running Mac app"
 

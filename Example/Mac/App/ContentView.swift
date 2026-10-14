@@ -10,6 +10,8 @@ struct ContentView: View {
       Text(Probe.record("swiftui", "SwiftUI Body"))
         .font(.largeTitle.bold())
 
+      subtitle
+
       Text("State survived: \(count)")
         .monospacedDigit()
 
@@ -24,6 +26,11 @@ struct ContentView: View {
         .frame(height: 64)
     }
     .padding(32)
+  }
+
+  private var subtitle: some View {
+    Text(Probe.record("helper", "Helper Property"))
+      .foregroundStyle(.secondary)
   }
 }
 

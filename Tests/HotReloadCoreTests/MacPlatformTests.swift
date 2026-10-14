@@ -165,3 +165,130 @@ struct AppKitPlanningTests {
     }
   }
 }
+
+@Suite("Computed properties and struct methods")
+struct ComputedMemberPlanningTests {
+  static let baseline = """
+    import SwiftUI
+
+    struct SessionsView: View {
+      @State private var query = ""
+      let titles: [String]
+
+      var body: some View {
+        VStack {
+          header
+          ForEach(titles, id: \\.self) { row($0) }
+        }
+      }
+
+      @ViewBuilder
+      private var header: some View {
+        Text("Sessions")
+      }
+
+      private var count: Int {
+        get { titles.count }
+      }
+
+      private func row(_ title: String) -> some View {
+        Text(title)
+      }
+
+      mutating func reset() {
+        query.removeAll()
+      }
+    }
+    """
+
+  @Test("a computed `some View` helper property edit replaces only that property")
+  func helperPropertyEdit() throws {
+    let edited = Self.baseline.replacingOccurrences(
+      of: #"Text("Sessions")"#, with: #"Text("All Sessions").bold()"#)
+    let plan = try ReplacementPlanner.plan(
+      baseline: Self.baseline, edited: edited, module: "MacApp",
+      sourceFile: "SessionsView.swift", generation: 4)
+    guard case .replace(let replacement) = plan else {
+      Issue.record("Expected a replacement, got \(plan)")
+      return
+    }
+    #expect(
+      replacement.source.contains(
+        """
+        extension SessionsView {
+          @_dynamicReplacement(for: header)
+          @ViewBuilder var __hotReload_header_4: some View {
+            Text("All Sessions").bold()
+          }
+        }
+        """))
+    #expect(!replacement.source.contains("for: body"))
+  }
+
+  @Test("explicit getters and struct methods (including mutating) reload")
+  func getterAndStructMethodEdits() throws {
+    let edited =
+      Self.baseline
+      .replacingOccurrences(of: "get { titles.count }", with: "get { titles.count + 1 }")
+      .replacingOccurrences(of: "Text(title)", with: "Text(title).monospaced()")
+      .replacingOccurrences(of: "query.removeAll()", with: #"query = "reset""#)
+    let plan = try ReplacementPlanner.plan(
+      baseline: Self.baseline, edited: edited, module: "MacApp",
+      sourceFile: "SessionsView.swift", generation: 2)
+    guard case .replace(let replacement) = plan else {
+      Issue.record("Expected a replacement, got \(plan)")
+      return
+    }
+    #expect(replacement.source.contains("@_dynamicReplacement(for: count)"))
+    #expect(replacement.source.contains("var __hotReload_count_2_2: Int {"))
+    #expect(replacement.source.contains("titles.count + 1"))
+    #expect(replacement.source.contains("@_dynamicReplacement(for: row(_:))"))
+    #expect(replacement.source.contains("func __hotReload_row_3_2(_ title: String) -> some View"))
+    #expect(replacement.source.contains("@_dynamicReplacement(for: reset())"))
+    #expect(replacement.source.contains("mutating func __hotReload_reset_4_2()"))
+  }
+
+  @Test("changing a computed property's type, or adding a setter, rebuilds")
+  func propertySignatureChangesRebuild() throws {
+    let retyped = Self.baseline.replacingOccurrences(
+      of: "private var count: Int {", with: "private var count: Double {")
+    let retypedPlan = try ReplacementPlanner.plan(
+      baseline: Self.baseline, edited: retyped, module: "MacApp",
+      sourceFile: "SessionsView.swift", generation: 1)
+    guard case .rebuild = retypedPlan else {
+      Issue.record("Expected a rebuild, got \(retypedPlan)")
+      return
+    }
+
+    let withSetter = Self.baseline.replacingOccurrences(
+      of: "get { titles.count }", with: "get { titles.count }\n    set {}")
+    let setterPlan = try ReplacementPlanner.plan(
+      baseline: Self.baseline, edited: withSetter, module: "MacApp",
+      sourceFile: "SessionsView.swift", generation: 1)
+    guard case .rebuild = setterPlan else {
+      Issue.record("Expected a rebuild, got \(setterPlan)")
+      return
+    }
+  }
+
+  @Test("a computed property with a non-View opaque type rebuilds when edited")
+  func opaqueNonViewPropertyRebuilds() throws {
+    let baseline = """
+      import SwiftUI
+
+      struct Shapes {
+        var shape: some Shape {
+          Circle()
+        }
+      }
+      """
+    let edited = baseline.replacingOccurrences(of: "Circle()", with: "Capsule()")
+    let plan = try ReplacementPlanner.plan(
+      baseline: baseline, edited: edited, module: "MacApp",
+      sourceFile: "Shapes.swift", generation: 1)
+    #expect(
+      plan
+        == .rebuild(
+          reason: "Computed properties with opaque types other than some View require a rebuild"))
+  }
+}
